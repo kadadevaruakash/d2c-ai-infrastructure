@@ -1,0 +1,270 @@
+{
+  "name": "SC-02: Customer Journey Funnel Analytics Agent",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "expression": "0 8 * * *"
+            }
+          ]
+        }
+      },
+      "id": "schedule-trigger",
+      "name": "Schedule: Daily 8 AM",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1,
+      "position": [250, 300]
+    },
+    {
+      "parameters": {
+        "operation": "getAll",
+        "resource": "order",
+        "limit": 500,
+        "filters": {
+          "created_at_min": "={{ DateTime.now().minus({ days: 7 }).toISO() }}"
+        },
+        "options": {}
+      },
+      "id": "shopify-orders",
+      "name": "Get Orders (7 days)",
+      "type": "n8n-nodes-base.shopify",
+      "typeVersion": 1,
+      "position": [450, 200],
+      "credentials": {
+        "shopifyApi": {
+          "id": "YOUR_SHOPIFY_CREDENTIAL_ID",
+          "name": "Shopify account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "url": "=https://analyticsdata.googleapis.com/v1beta/properties/{{ $env.GA4_PROPERTY_ID }}:runReport",
+        "method": "POST",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "googleAuth",
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={\"dateRanges\": [{\"startDate\": \"7daysAgo\", \"endDate\": \"today\"}], \"metrics\": [{\"name\": \"sessions\"}, {\"name\": \"screenPageViews\"}, {\"name\": \"addToCarts\"}, {\"name\": \"checkouts\"}, {\"name\": \"purchases\"}], \"dimensions\": [{\"name\": \"sessionDefaultChannelGroup\"}]}",
+        "options": {}
+      },
+      "id": "ga4-fetch",
+      "name": "Get GA4 Funnel Data",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [450, 400],
+      "credentials": {
+        "googleAuth": {
+          "id": "YOUR_GOOGLE_CREDENTIAL_ID",
+          "name": "Google Analytics"
+        }
+      },
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// Calculate funnel metrics\nconst orders = $input.all()[0]?.json || [];\nconst ga4Data = $input.all()[1]?.json?.rows || [];\n\n// Aggregate GA4 data\nconst totalSessions = ga4Data.reduce((sum, row) => sum + parseInt(row.metricValues?.[0]?.value || 0), 0);\nconst totalPageViews = ga4Data.reduce((sum, row) => sum + parseInt(row.metricValues?.[1]?.value || 0), 0);\nconst totalAddToCarts = ga4Data.reduce((sum, row) => sum + parseInt(row.metricValues?.[2]?.value || 0), 0);\nconst totalCheckouts = ga4Data.reduce((sum, row) => sum + parseInt(row.metricValues?.[3]?.value || 0), 0);\nconst totalPurchases = orders.length;\n\n// Calculate conversion rates\nconst awarenessToInterest = totalSessions > 0 ? ((totalPageViews / totalSessions) * 100).toFixed(2) : 0;\nconst interestToConsideration = totalPageViews > 0 ? ((totalAddToCarts / totalPageViews) * 100).toFixed(2) : 0;\nconst considerationToConversion = totalAddToCarts > 0 ? ((totalCheckouts / totalAddToCarts) * 100).toFixed(2) : 0;\nconst conversionToPurchase = totalCheckouts > 0 ? ((totalPurchases / totalCheckouts) * 100).toFixed(2) : 0;\nconst overallConversion = totalSessions > 0 ? ((totalPurchases / totalSessions) * 100).toFixed(2) : 0;\n\n// Identify drop-off points\nconst dropoffs = [];\nif (awarenessToInterest < 50) dropoffs.push({ stage: 'Awareness → Interest', rate: awarenessToInterest + '%' });\nif (interestToConsideration < 10) dropoffs.push({ stage: 'Interest → Consideration', rate: interestToConsideration + '%' });\nif (considerationToConversion < 30) dropoffs.push({ stage: 'Consideration → Conversion', rate: considerationToConversion + '%' });\nif (conversionToPurchase < 60) dropoffs.push({ stage: 'Conversion → Purchase', rate: conversionToPurchase + '%' });\n\n// Revenue attribution\nconst revenueByChannel = {};\norders.forEach(order => {\n  const source = order.source_name || 'direct';\n  if (!revenueByChannel[source]) revenueByChannel[source] = 0;\n  revenueByChannel[source] += parseFloat(order.total_price || 0);\n});\n\nreturn [{\n  json: {\n    date_range: 'Last 7 days',\n    funnel: {\n      awareness: { sessions: totalSessions },\n      interest: { page_views: totalPageViews, conversion_rate: awarenessToInterest },\n      consideration: { add_to_carts: totalAddToCarts, conversion_rate: interestToConsideration },\n      conversion: { checkouts: totalCheckouts, conversion_rate: considerationToConversion },\n      purchase: { orders: totalPurchases, conversion_rate: conversionToPurchase }\n    },\n    overall_conversion_rate: overallConversion,\n    dropoff_points: dropoffs,\n    revenue_by_channel: revenueByChannel,\n    generated_at: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "code-calculate",
+      "name": "Calculate Funnel",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [650, 300]
+    },
+    {
+      "parameters": {
+        "model": "gpt-4o-mini",
+        "options": {},
+        "messages": {
+          "message": [
+            {
+              "role": "system",
+              "content": "You are a growth analyst specializing in funnel optimization. Analyze funnel performance, identify biggest drop-off stage, calculate channel ROAS, recommend top 3 optimization actions with expected impact. Focus on actionable insights. Quantify recommendations."
+            },
+            {
+              "role": "user",
+              "content": "=Date range: {{ $json.date_range }}\nOverall conversion: {{ $json.overall_conversion_rate }}%\nDrop-off points: {{ JSON.stringify($json.dropoff_points) }}\nRevenue by channel: {{ JSON.stringify($json.revenue_by_channel) }}\n\nProvide 3 optimization recommendations with expected impact."
+            }
+          ]
+        }
+      },
+      "id": "openai-analyze",
+      "name": "AI: Analyze Funnel",
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1,
+      "position": [850, 300],
+      "credentials": {
+        "openAiApi": {
+          "id": "YOUR_OPENAI_CREDENTIAL_ID",
+          "name": "OpenAI account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Process analysis\nconst aiResponse = $input.first().json.content;\nconst funnel = $input.all()[0].json;\n\nreturn [{\n  json: {\n    ...funnel,\n    analysis: aiResponse,\n    report_id: 'FUNNEL-' + Date.now()\n  }\n}];"
+      },
+      "id": "code-process",
+      "name": "Process Analysis",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1050, 300]
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": "={{ $env.GOOGLE_SHEETS_DOC_ID }}",
+        "sheetName": "Funnel Analytics",
+        "columns": {
+          "columnValues": [
+            {
+              "column": "Date",
+              "value": "={{ $now }}"
+            },
+            {
+              "column": "Sessions",
+              "value": "={{ $json.funnel.awareness.sessions }}"
+            },
+            {
+              "column": "Page Views",
+              "value": "={{ $json.funnel.interest.page_views }}"
+            },
+            {
+              "column": "Add to Carts",
+              "value": "={{ $json.funnel.consideration.add_to_carts }}"
+            },
+            {
+              "column": "Checkouts",
+              "value": "={{ $json.funnel.conversion.checkouts }}"
+            },
+            {
+              "column": "Purchases",
+              "value": "={{ $json.funnel.purchase.orders }}"
+            },
+            {
+              "column": "Conversion Rate",
+              "value": "={{ $json.overall_conversion_rate }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "sheets-log",
+      "name": "Log to Sheets",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4,
+      "position": [1250, 200],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "YOUR_GOOGLE_CREDENTIAL_ID",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "channel": "=#analytics",
+        "text": "=📈 FUNNEL ANALYTICS REPORT\n\nPeriod: {{ $json.date_range }}\nOverall Conversion: {{ $json.overall_conversion_rate }}%\n\nFunnel:\n• Awareness: {{ $json.funnel.awareness.sessions }} sessions\n• Interest: {{ $json.funnel.interest.page_views }} views ({{ $json.funnel.interest.conversion_rate }}%)\n• Consideration: {{ $json.funnel.consideration.add_to_carts }} ATC ({{ $json.funnel.consideration.conversion_rate }}%)\n• Conversion: {{ $json.funnel.conversion.checkouts }} checkouts ({{ $json.funnel.conversion.conversion_rate }}%)\n• Purchase: {{ $json.funnel.purchase.orders }} orders ({{ $json.funnel.purchase.conversion_rate }}%)\n\n{{ $json.dropoff_points.length > 0 ? '⚠️ Drop-off Points:\\n' + $json.dropoff_points.map(d => '• ' + d.stage + ': ' + d.rate).join('\\n') : '✅ No major drop-offs' }}\n\n💡 Analysis:\n{{ $json.analysis.substring(0, 500) }}...",
+        "otherOptions": {}
+      },
+      "id": "slack-notify",
+      "name": "Notify Slack",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [1250, 400],
+      "credentials": {
+        "slackApi": {
+          "id": "YOUR_SLACK_CREDENTIAL_ID",
+          "name": "Slack account"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Schedule: Daily 8 AM": {
+      "main": [
+        [
+          {
+            "node": "Get Orders (7 days)",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Get GA4 Funnel Data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Orders (7 days)": {
+      "main": [
+        [
+          {
+            "node": "Calculate Funnel",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get GA4 Funnel Data": {
+      "main": [
+        [
+          {
+            "node": "Calculate Funnel",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Calculate Funnel": {
+      "main": [
+        [
+          {
+            "node": "AI: Analyze Funnel",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI: Analyze Funnel": {
+      "main": [
+        [
+          {
+            "node": "Process Analysis",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Process Analysis": {
+      "main": [
+        [
+          {
+            "node": "Log to Sheets",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Notify Slack",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true
+  },
+  "tags": ["d2c", "scale", "analytics", "funnel", "scheduled"],
+  "pinData": {}
+}

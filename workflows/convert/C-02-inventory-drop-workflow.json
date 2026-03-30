@@ -1,0 +1,344 @@
+{
+  "name": "C-02: Product Launch & Inventory Drop Bot",
+  "nodes": [
+    {
+      "parameters": {
+        "event": "inventory_level_update",
+        "options": {}
+      },
+      "id": "shopify-trigger",
+      "name": "Shopify: Inventory Change",
+      "type": "n8n-nodes-base.shopifyTrigger",
+      "typeVersion": 1,
+      "position": [250, 300],
+      "credentials": {
+        "shopifyApi": {
+          "id": "YOUR_SHOPIFY_CREDENTIAL_ID",
+          "name": "Shopify account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse inventory update\nconst data = $input.first().json;\n\nconst isRestock = parseInt(data.available) > 0 && parseInt(data.available) > (data.previous_available || 0);\nconst isLaunch = data.is_new_product === true;\n\n// Only proceed if it's a restock or new launch\nif (!isRestock && !isLaunch) {\n  return []; // Skip if just regular inventory change\n}\n\nreturn [{\n  json: {\n    product_id: data.inventory_item_id || data.variant_id,\n    variant_id: data.variant_id,\n    product_name: data.title || 'Unknown Product',\n    previous_quantity: data.previous_available || 0,\n    current_quantity: parseInt(data.available) || 0,\n    is_restock: isRestock,\n    is_launch: isLaunch,\n    triggered_at: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "code-parse",
+      "name": "Parse Inventory",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [450, 300]
+    },
+    {
+      "parameters": {
+        "operation": "select",
+        "tableId": "product_waitlist",
+        "filters": {
+          "conditions": [
+            {
+              "column": "product_id",
+              "condition": "eq",
+              "value": "={{ $json.product_id }}"
+            }
+          ]
+        }
+      },
+      "id": "supabase-waitlist",
+      "name": "Get Waitlist",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [650, 200],
+      "credentials": {
+        "supabaseApi": {
+          "id": "YOUR_SUPABASE_CREDENTIAL_ID",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "select",
+        "tableId": "customers",
+        "filters": {
+          "conditions": [
+            {
+              "column": "vip_tier",
+              "condition": "eq",
+              "value": "vip"
+            }
+          ],
+          "limit": 100
+        }
+      },
+      "id": "supabase-vip",
+      "name": "Get VIP List",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [650, 400],
+      "credentials": {
+        "supabaseApi": {
+          "id": "YOUR_SUPABASE_CREDENTIAL_ID",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "model": "gpt-4o-mini",
+        "options": {},
+        "messages": {
+          "message": [
+            {
+              "role": "system",
+              "content": "You are a product launch copywriter. Create urgency-driven launch messages. VIP early access (2 hours before), waitlist priority, scarcity messaging based on stock levels. Return 3 versions: VIP, Waitlist, General."
+            },
+            {
+              "role": "user",
+              "content": "=Product: {{ $json.product_name }}\nType: {{ $json.is_restock ? 'Restock' : 'New Launch' }}\nStock level: {{ $json.current_quantity }}\nWaitlist size: {{ $json.waitlist_count || 0 }}\n\nReturn JSON:\n{\"vip_message\": \"string\", \"waitlist_message\": \"string\", \"general_message\": \"string\", \"urgency_level\": \"high|medium|low\"}"
+            }
+          ]
+        }
+      },
+      "id": "openai-write",
+      "name": "AI: Write Messages",
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1,
+      "position": [850, 300],
+      "credentials": {
+        "openAiApi": {
+          "id": "YOUR_OPENAI_CREDENTIAL_ID",
+          "name": "OpenAI account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Merge all data\nconst inventory = $input.all()[0].json;\nconst waitlist = $input.all()[1]?.json || [];\nconst vips = $input.all()[2]?.json || [];\nconst aiResponse = $input.all()[3]?.json?.content || '{}';\n\nlet messages;\ntry {\n  messages = JSON.parse(aiResponse);\n} catch (e) {\n  messages = {\n    vip_message: `🔥 EARLY ACCESS: ${inventory.product_name} is back!`,\n    waitlist_message: `📢 ${inventory.product_name} is now available!`,\n    general_message: `${inventory.product_name} is back in stock!`,\n    urgency_level: 'high'\n  };\n}\n\nreturn [{\n  json: {\n    product_id: inventory.product_id,\n    product_name: inventory.product_name,\n    stock_level: inventory.current_quantity,\n    is_restock: inventory.is_restock,\n    waitlist_count: waitlist.length,\n    vip_count: vips.length,\n    messages: messages,\n    vip_list: vips.map(v => v.phone || v.email),\n    waitlist_emails: waitlist.map(w => w.email),\n    notification_id: 'NOTIF-' + Date.now()\n  }\n}];"
+      },
+      "id": "code-merge",
+      "name": "Merge Data",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1050, 300]
+    },
+    {
+      "parameters": {
+        "sendOptions": "=options",
+        "fromEmail": "={{ $env.BREVO_FROM_EMAIL }}",
+        "toEmail": "={{ $json.vip_list.join(',') }}",
+        "subject": "=🔥 EARLY ACCESS: {{ $json.product_name }}",
+        "html": "=<h2>{{ $json.messages.vip_message }}</h2><p>As a VIP, you get 2-hour early access!</p><p>Only {{ $json.stock_level }} units available.</p><p><a href='https://yourstore.com/products/{{ $json.product_id }}'>Shop Now</a></p>",
+        "options": {}
+      },
+      "id": "brevo-vip",
+      "name": "Send VIP Email",
+      "type": "n8n-nodes-base.sendInBlue",
+      "typeVersion": 1,
+      "position": [1250, 200],
+      "credentials": {
+        "sendInBlueApi": {
+          "id": "YOUR_BREVO_CREDENTIAL_ID",
+          "name": "Brevo account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "sendOptions": "=options",
+        "fromEmail": "={{ $env.BREVO_FROM_EMAIL }}",
+        "toEmail": "={{ $json.waitlist_emails.join(',') }}",
+        "subject": "=📢 {{ $json.product_name }} is BACK!",
+        "html": "=<h2>{{ $json.messages.waitlist_message }}</h2><p>You asked, we delivered! {{ $json.product_name }} is now available.</p><p><a href='https://yourstore.com/products/{{ $json.product_id }}'>Shop Now</a></p>",
+        "options": {}
+      },
+      "id": "brevo-waitlist",
+      "name": "Send Waitlist Email",
+      "type": "n8n-nodes-base.sendInBlue",
+      "typeVersion": 1,
+      "position": [1250, 350],
+      "credentials": {
+        "sendInBlueApi": {
+          "id": "YOUR_BREVO_CREDENTIAL_ID",
+          "name": "Brevo account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "tableId": "inventory_notifications",
+        "fields": [
+          {
+            "fieldId": "notification_id",
+            "value": "={{ $json.notification_id }}"
+          },
+          {
+            "fieldId": "product_id",
+            "value": "={{ $json.product_id }}"
+          },
+          {
+            "fieldId": "product_name",
+            "value": "={{ $json.product_name }}"
+          },
+          {
+            "fieldId": "vip_sent",
+            "value": "={{ $json.vip_count }}"
+          },
+          {
+            "fieldId": "waitlist_sent",
+            "value": "={{ $json.waitlist_count }}"
+          },
+          {
+            "fieldId": "created_at",
+            "value": "={{ $now }}"
+          }
+        ]
+      },
+      "id": "supabase-log",
+      "name": "Log Notification",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [1450, 300],
+      "credentials": {
+        "supabaseApi": {
+          "id": "YOUR_SUPABASE_CREDENTIAL_ID",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "channel": "=#product-launches",
+        "text": "=🚀 INVENTORY NOTIFICATION SENT\n\nProduct: {{ $json.product_name }}\nStock: {{ $json.stock_level }} units\nVIP notified: {{ $json.vip_count }}\nWaitlist notified: {{ $json.waitlist_count }}\nUrgency: {{ $json.messages.urgency_level }}",
+        "otherOptions": {}
+      },
+      "id": "slack-notify",
+      "name": "Notify Slack",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [1650, 300],
+      "credentials": {
+        "slackApi": {
+          "id": "YOUR_SLACK_CREDENTIAL_ID",
+          "name": "Slack account"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Shopify: Inventory Change": {
+      "main": [
+        [
+          {
+            "node": "Parse Inventory",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Inventory": {
+      "main": [
+        [
+          {
+            "node": "Get Waitlist",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Get VIP List",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Waitlist": {
+      "main": [
+        [
+          {
+            "node": "AI: Write Messages",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get VIP List": {
+      "main": [
+        [
+          {
+            "node": "AI: Write Messages",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI: Write Messages": {
+      "main": [
+        [
+          {
+            "node": "Merge Data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge Data": {
+      "main": [
+        [
+          {
+            "node": "Send VIP Email",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Send Waitlist Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send VIP Email": {
+      "main": [
+        [
+          {
+            "node": "Log Notification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Waitlist Email": {
+      "main": [
+        [
+          {
+            "node": "Log Notification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Notification": {
+      "main": [
+        [
+          {
+            "node": "Notify Slack",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true
+  },
+  "tags": ["d2c", "convert", "inventory", "launch"],
+  "pinData": {}
+}

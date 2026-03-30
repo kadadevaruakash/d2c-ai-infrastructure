@@ -1,0 +1,304 @@
+{
+  "name": "C-03: Amazon PDP Optimization Agent",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "expression": "0 6 * * 1"
+            }
+          ]
+        }
+      },
+      "id": "schedule-trigger",
+      "name": "Schedule: Weekly Mon 6 AM",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1,
+      "position": [250, 300]
+    },
+    {
+      "parameters": {
+        "operation": "select",
+        "tableId": "amazon_listings",
+        "filters": {
+          "conditions": [
+            {
+              "column": "status",
+              "condition": "eq",
+              "value": "active"
+            }
+          ],
+          "limit": 10
+        }
+      },
+      "id": "supabase-listings",
+      "name": "Get Amazon Listings",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [450, 300],
+      "credentials": {
+        "supabaseApi": {
+          "id": "YOUR_SUPABASE_CREDENTIAL_ID",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {},
+      "id": "split-batch",
+      "name": "Split in Batches",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [650, 300]
+    },
+    {
+      "parameters": {
+        "model": "gpt-4o-mini",
+        "options": {},
+        "messages": {
+          "message": [
+            {
+              "role": "system",
+              "content": "You are an Amazon listing optimization expert. Optimize: 1) Title (max 200 chars, include top 3 keywords), 2) 5 bullet points (benefit-focused, keyword-rich), 3) Backend keywords. Follow Amazon TOS. No promotional language."
+            },
+            {
+              "role": "user",
+              "content": "=ASIN: {{ $json.asin }}\nCurrent title: {{ $json.current_title }}\nCurrent bullets: {{ $json.current_bullets }}\nTop search terms: {{ $json.search_terms }}\nCompetitor titles: {{ $json.competitor_titles }}\nConversion rate: {{ $json.conversion_rate }}%\n\nReturn JSON:\n{\"title\": \"string (max 200 chars)\", \"bullets\": [\"string\", \"string\", \"string\", \"string\", \"string\"], \"backend_keywords\": \"string\", \"confidence_score\": number (0-1)}"
+            }
+          ]
+        }
+      },
+      "id": "openai-optimize",
+      "name": "AI: Optimize Listing",
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1,
+      "position": [850, 300],
+      "credentials": {
+        "openAiApi": {
+          "id": "YOUR_OPENAI_CREDENTIAL_ID",
+          "name": "OpenAI account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse optimization\nconst aiResponse = $input.first().json.content;\nlet optimization;\n\ntry {\n  optimization = JSON.parse(aiResponse);\n} catch (e) {\n  optimization = {\n    title: $input.all()[0].json.current_title,\n    bullets: ['Feature 1', 'Feature 2', 'Feature 3', 'Feature 4', 'Feature 5'],\n    backend_keywords: '',\n    confidence_score: 0.5\n  };\n}\n\nconst listing = $input.all()[0].json;\n\n// Determine if approval needed\nconst needsApproval = optimization.confidence_score < 0.7;\n\nreturn [{\n  json: {\n    asin: listing.asin,\n    optimization_id: 'OPT-' + Date.now(),\n    current_title: listing.current_title,\n    new_title: optimization.title,\n    new_bullets: optimization.bullets,\n    backend_keywords: optimization.backend_keywords,\n    confidence_score: optimization.confidence_score,\n    needs_approval: needsApproval,\n    changes_summary: [\n      listing.current_title !== optimization.title ? 'Title updated' : null,\n      'Bullets updated'\n    ].filter(Boolean),\n    created_at: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "code-parse",
+      "name": "Parse Optimization",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1050, 300]
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "tableId": "listing_optimizations",
+        "fields": [
+          {
+            "fieldId": "optimization_id",
+            "value": "={{ $json.optimization_id }}"
+          },
+          {
+            "fieldId": "asin",
+            "value": "={{ $json.asin }}"
+          },
+          {
+            "fieldId": "new_title",
+            "value": "={{ $json.new_title }}"
+          },
+          {
+            "fieldId": "new_bullets",
+            "value": "={{ JSON.stringify($json.new_bullets) }}"
+          },
+          {
+            "fieldId": "confidence_score",
+            "value": "={{ $json.confidence_score }}"
+          },
+          {
+            "fieldId": "status",
+            "value": "={{ $json.needs_approval ? 'pending_approval' : 'approved' }}"
+          },
+          {
+            "fieldId": "created_at",
+            "value": "={{ $json.created_at }}"
+          }
+        ]
+      },
+      "id": "supabase-store",
+      "name": "Store Optimization",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [1250, 200],
+      "credentials": {
+        "supabaseApi": {
+          "id": "YOUR_SUPABASE_CREDENTIAL_ID",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "condition-1",
+              "leftValue": "={{ $json.needs_approval }}",
+              "rightValue": "true",
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "if-approval",
+      "name": "Needs Approval?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1250, 400]
+    },
+    {
+      "parameters": {
+        "channel": "=#amazon-ops",
+        "text": "=📦 LISTING OPTIMIZATION READY\n\nASIN: {{ $json.asin }}\nConfidence: {{ ($json.confidence_score * 100).toFixed(0) }}%\n\n{{ $json.needs_approval ? '⚠️ REQUIRES APPROVAL' : '✅ AUTO-APPROVED' }}\n\nChanges:\n• {{ $json.changes_summary.join('\\n• ') }}\n\nReview: https://yourdashboard.com/optimizations/{{ $json.optimization_id }}",
+        "otherOptions": {}
+      },
+      "id": "slack-notify",
+      "name": "Notify Slack",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [1450, 350],
+      "credentials": {
+        "slackApi": {
+          "id": "YOUR_SLACK_CREDENTIAL_ID",
+          "name": "Slack account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "channel": "=#amazon-ops",
+        "text": "=✅ HIGH CONFIDENCE OPTIMIZATION APPLIED\n\nASIN: {{ $json.asin }}\nConfidence: {{ ($json.confidence_score * 100).toFixed(0) }}%\n\nChanges applied automatically. Monitor performance over next 7 days.",
+        "otherOptions": {}
+      },
+      "id": "slack-auto",
+      "name": "Notify Auto-Applied",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [1450, 450],
+      "credentials": {
+        "slackApi": {
+          "id": "YOUR_SLACK_CREDENTIAL_ID",
+          "name": "Slack account"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Schedule: Weekly Mon 6 AM": {
+      "main": [
+        [
+          {
+            "node": "Get Amazon Listings",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Amazon Listings": {
+      "main": [
+        [
+          {
+            "node": "Split in Batches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split in Batches": {
+      "main": [
+        [
+          {
+            "node": "AI: Optimize Listing",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI: Optimize Listing": {
+      "main": [
+        [
+          {
+            "node": "Parse Optimization",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Optimization": {
+      "main": [
+        [
+          {
+            "node": "Store Optimization",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Needs Approval?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Needs Approval?": {
+      "main": [
+        [
+          {
+            "node": "Notify Slack",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Notify Auto-Applied",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Store Optimization": {
+      "main": [
+        [
+          {
+            "node": "Split in Batches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true
+  },
+  "tags": ["d2c", "convert", "amazon", "seo", "scheduled"],
+  "pinData": {}
+}

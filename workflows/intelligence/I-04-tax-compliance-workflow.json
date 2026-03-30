@@ -1,0 +1,260 @@
+{
+  "name": "I-04: Tax & Compliance Estimator Agent",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "expression": "0 9 1 * *"
+            }
+          ]
+        }
+      },
+      "id": "schedule-trigger",
+      "name": "Schedule: Monthly 1st 9 AM",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1,
+      "position": [250, 300]
+    },
+    {
+      "parameters": {
+        "operation": "getAll",
+        "resource": "order",
+        "limit": 500,
+        "filters": {
+          "created_at_min": "={{ DateTime.now().minus({ months: 1 }).startOf('month').toISO() }}",
+          "created_at_max": "={{ DateTime.now().minus({ months: 1 }).endOf('month').toISO() }}"
+        },
+        "options": {}
+      },
+      "id": "shopify-orders",
+      "name": "Get Last Month Orders",
+      "type": "n8n-nodes-base.shopify",
+      "typeVersion": 1,
+      "position": [450, 300],
+      "credentials": {
+        "shopifyApi": {
+          "id": "YOUR_SHOPIFY_CREDENTIAL_ID",
+          "name": "Shopify account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Calculate tax by jurisdiction\nconst orders = $input.first().json || [];\n\nconst jurisdictionData = {};\n\norders.forEach(order => {\n  const country = order.shipping_address?.country_code || 'US';\n  const state = order.shipping_address?.province_code || 'unknown';\n  const key = `${country}-${state}`;\n  \n  if (!jurisdictionData[key]) {\n    jurisdictionData[key] = {\n      country: country,\n      state: state,\n      revenue: 0,\n      orders: 0,\n      tax_rate: getTaxRate(country, state)\n    };\n  }\n  \n  jurisdictionData[key].revenue += parseFloat(order.total_price || 0);\n  jurisdictionData[key].orders += 1;\n});\n\nfunction getTaxRate(country, state) {\n  const rates = {\n    'US-CA': 0.0725,\n    'US-NY': 0.08,\n    'US-TX': 0.0625,\n    'US-FL': 0.06,\n    'US-WA': 0.065,\n    'GB': 0.20,\n    'EU': 0.20,\n    'AU': 0.10\n  };\n  return rates[`${country}-${state}`] || rates[country] || 0;\n}\n\n// Calculate estimated tax\nconst jurisdictions = Object.values(jurisdictionData).map(j => ({\n  ...j,\n  estimated_tax: j.revenue * j.tax_rate\n}));\n\nconst totalRevenue = jurisdictions.reduce((sum, j) => sum + j.revenue, 0);\nconst totalTax = jurisdictions.reduce((sum, j) => sum + j.estimated_tax, 0);\n\nreturn [{\n  json: {\n    period: DateTime.now().minus({ months: 1 }).toFormat('yyyy-MM'),\n    total_revenue: totalRevenue.toFixed(2),\n    total_orders: orders.length,\n    jurisdictions: jurisdictions,\n    total_estimated_tax: totalTax.toFixed(2),\n    disclaimer: 'This is an estimation only. Consult a tax professional for accurate calculations.',\n    generated_at: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "code-calculate",
+      "name": "Calculate Tax",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [650, 300]
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": "={{ $env.GOOGLE_SHEETS_DOC_ID }}",
+        "sheetName": "Tax Reports",
+        "columns": {
+          "columnValues": [
+            {
+              "column": "Period",
+              "value": "={{ $json.period }}"
+            },
+            {
+              "column": "Total Revenue",
+              "value": "={{ $json.total_revenue }}"
+            },
+            {
+              "column": "Total Orders",
+              "value": "={{ $json.total_orders }}"
+            },
+            {
+              "column": "Jurisdictions",
+              "value": "={{ $json.jurisdictions.length }}"
+            },
+            {
+              "column": "Estimated Tax",
+              "value": "={{ $json.total_estimated_tax }}"
+            },
+            {
+              "column": "Generated At",
+              "value": "={{ $json.generated_at }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "sheets-log",
+      "name": "Log to Sheets",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4,
+      "position": [850, 200],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "YOUR_GOOGLE_CREDENTIAL_ID",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "tableId": "tax_reports",
+        "fields": [
+          {
+            "fieldId": "period",
+            "value": "={{ $json.period }}"
+          },
+          {
+            "fieldId": "total_revenue",
+            "value": "={{ $json.total_revenue }}"
+          },
+          {
+            "fieldId": "total_orders",
+            "value": "={{ $json.total_orders }}"
+          },
+          {
+            "fieldId": "total_estimated_tax",
+            "value": "={{ $json.total_estimated_tax }}"
+          },
+          {
+            "fieldId": "jurisdictions",
+            "value": "={{ JSON.stringify($json.jurisdictions) }}"
+          },
+          {
+            "fieldId": "created_at",
+            "value": "={{ $json.generated_at }}"
+          }
+        ]
+      },
+      "id": "supabase-store",
+      "name": "Store Report",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [850, 400],
+      "credentials": {
+        "supabaseApi": {
+          "id": "YOUR_SUPABASE_CREDENTIAL_ID",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "to": "=finance@yourcompany.com",
+        "subject": "=📋 Monthly Tax Estimate — {{ $json.period }}",
+        "text": "=Monthly Tax Estimate — {{ $json.period }}\\n\\nTotal Revenue: ${{ $json.total_revenue }}\\nTotal Orders: {{ $json.total_orders }}\\nEstimated Tax: ${{ $json.total_estimated_tax }}\\n\\nBy Jurisdiction:\\n{{ $json.jurisdictions.map(j => `${j.country}-${j.state}: $${j.estimated_tax.toFixed(2)} (${j.orders} orders)`).join('\\n') }}\\n\\n⚠️ {{ $json.disclaimer }}\\n\\nFull report: Google Sheets",
+        "options": {}
+      },
+      "id": "email-send",
+      "name": "Email Finance Team",
+      "type": "n8n-nodes-base.sendEmail",
+      "typeVersion": 2,
+      "position": [1050, 300]
+    },
+    {
+      "parameters": {
+        "channel": "=#finance",
+        "text": "=📋 MONTHLY TAX ESTIMATE\n\nPeriod: {{ $json.period }}\nRevenue: ${{ $json.total_revenue }}\nOrders: {{ $json.total_orders }}\nEstimated Tax: ${{ $json.total_estimated_tax }}\n\nJurisdictions: {{ $json.jurisdictions.length }}\n\n⚠️ {{ $json.disclaimer }}\n\nReport sent to finance team.",
+        "otherOptions": {}
+      },
+      "id": "slack-notify",
+      "name": "Notify Slack",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [1250, 300],
+      "credentials": {
+        "slackApi": {
+          "id": "YOUR_SLACK_CREDENTIAL_ID",
+          "name": "Slack account"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Schedule: Monthly 1st 9 AM": {
+      "main": [
+        [
+          {
+            "node": "Get Last Month Orders",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Last Month Orders": {
+      "main": [
+        [
+          {
+            "node": "Calculate Tax",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Calculate Tax": {
+      "main": [
+        [
+          {
+            "node": "Log to Sheets",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Store Report",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Email Finance Team",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log to Sheets": {
+      "main": [
+        [
+          {
+            "node": "Notify Slack",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Store Report": {
+      "main": [
+        [
+          {
+            "node": "Notify Slack",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Email Finance Team": {
+      "main": [
+        [
+          {
+            "node": "Notify Slack",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true
+  },
+  "tags": ["d2c", "intelligence", "tax", "compliance", "scheduled"],
+  "pinData": {}
+}

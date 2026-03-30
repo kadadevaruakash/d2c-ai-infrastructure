@@ -1,0 +1,245 @@
+{
+  "name": "SC-04: Meta Tags & SEO Automation Agent",
+  "nodes": [
+    {
+      "parameters": {
+        "event": "product_created",
+        "options": {}
+      },
+      "id": "shopify-trigger",
+      "name": "Shopify: Product Created",
+      "type": "n8n-nodes-base.shopifyTrigger",
+      "typeVersion": 1,
+      "position": [250, 300],
+      "credentials": {
+        "shopifyApi": {
+          "id": "YOUR_SHOPIFY_CREDENTIAL_ID",
+          "name": "Shopify account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse product data\nconst product = $input.first().json;\n\nreturn [{\n  json: {\n    product_id: product.id,\n    title: product.title,\n    description: product.body_html || product.description || '',\n    handle: product.handle,\n    tags: product.tags || [],\n    product_type: product.product_type || '',\n    vendor: product.vendor || '',\n    images: (product.images || []).map(i => i.src),\n    variants: (product.variants || []).map(v => ({\n      id: v.id,\n      title: v.title,\n      price: v.price\n    }))\n  }\n}];"
+      },
+      "id": "code-parse",
+      "name": "Parse Product",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [450, 300]
+    },
+    {
+      "parameters": {
+        "model": "gpt-4o-mini",
+        "options": {},
+        "messages": {
+          "message": [
+            {
+              "role": "system",
+              "content": "You are an SEO specialist. Generate optimized meta title (50-60 chars), meta description (150-160 chars), OG title, OG description. Include target keyword naturally. Compelling CTR-focused copy. Follow character limits strictly."
+            },
+            {
+              "role": "user",
+              "content": "=Product: {{ $json.title }}\nDescription: {{ $json.description.substring(0, 200) }}...\nType: {{ $json.product_type }}\nTags: {{ $json.tags.join(', ') }}\n\nReturn JSON:\n{\"title_tag\": \"string (50-60 chars)\", \"meta_description\": \"string (150-160 chars)\", \"og_title\": \"string\", \"og_description\": \"string\", \"keywords\": [\"string\"], \"structured_data_type\": \"Product\"}"
+            }
+          ]
+        }
+      },
+      "id": "openai-generate",
+      "name": "AI: Generate Meta",
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1,
+      "position": [650, 300],
+      "credentials": {
+        "openAiApi": {
+          "id": "YOUR_OPENAI_CREDENTIAL_ID",
+          "name": "OpenAI account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse meta tags\nconst aiResponse = $input.first().json.content;\nconst product = $input.all()[0].json;\n\nlet meta;\ntry {\n  meta = JSON.parse(aiResponse);\n} catch (e) {\n  meta = {\n    title_tag: product.title.substring(0, 60),\n    meta_description: product.description.substring(0, 160),\n    og_title: product.title,\n    og_description: product.description.substring(0, 200),\n    keywords: product.tags,\n    structured_data_type: 'Product'\n  };\n}\n\nreturn [{\n  json: {\n    product_id: product.product_id,\n    product_title: product.title,\n    title_tag: meta.title_tag,\n    meta_description: meta.meta_description,\n    og_title: meta.og_title,\n    og_description: meta.og_description,\n    keywords: meta.keywords,\n    structured_data_type: meta.structured_data_type,\n    applied: false,\n    audit_score: 0,\n    timestamp: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "code-parse",
+      "name": "Parse Meta",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [850, 300]
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "tableId": "seo_meta_tags",
+        "fields": [
+          {
+            "fieldId": "product_id",
+            "value": "={{ $json.product_id }}"
+          },
+          {
+            "fieldId": "title_tag",
+            "value": "={{ $json.title_tag }}"
+          },
+          {
+            "fieldId": "meta_description",
+            "value": "={{ $json.meta_description }}"
+          },
+          {
+            "fieldId": "og_title",
+            "value": "={{ $json.og_title }}"
+          },
+          {
+            "fieldId": "og_description",
+            "value": "={{ $json.og_description }}"
+          },
+          {
+            "fieldId": "keywords",
+            "value": "={{ JSON.stringify($json.keywords) }}"
+          },
+          {
+            "fieldId": "status",
+            "value": "pending"
+          },
+          {
+            "fieldId": "created_at",
+            "value": "={{ $json.timestamp }}"
+          }
+        ]
+      },
+      "id": "supabase-store",
+      "name": "Store Meta Tags",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [1050, 200],
+      "credentials": {
+        "supabaseApi": {
+          "id": "YOUR_SUPABASE_CREDENTIAL_ID",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "resource": "product",
+        "productId": "={{ $json.product_id }}",
+        "updateFields": {
+          "fields": [
+            {
+              "fieldId": "metafields",
+              "value": "={{ JSON.stringify({ title_tag: $json.title_tag, meta_description: $json.meta_description }) }}"
+            }
+          ]
+        }
+      },
+      "id": "shopify-update",
+      "name": "Update Shopify",
+      "type": "n8n-nodes-base.shopify",
+      "typeVersion": 1,
+      "position": [1050, 400],
+      "credentials": {
+        "shopifyApi": {
+          "id": "YOUR_SHOPIFY_CREDENTIAL_ID",
+          "name": "Shopify account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "channel": "=#seo-updates",
+        "text": "=🏷️ META TAGS GENERATED\n\nProduct: {{ $json.product_title }}\nTitle: {{ $json.title_tag }} ({{ $json.title_tag.length }} chars)\nMeta: {{ $json.meta_description.substring(0, 50) }}... ({{ $json.meta_description.length }} chars)\n\nStatus: Pending Review\nKeywords: {{ $json.keywords.join(', ') }}",
+        "otherOptions": {}
+      },
+      "id": "slack-notify",
+      "name": "Notify Slack",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [1250, 300],
+      "credentials": {
+        "slackApi": {
+          "id": "YOUR_SLACK_CREDENTIAL_ID",
+          "name": "Slack account"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Shopify: Product Created": {
+      "main": [
+        [
+          {
+            "node": "Parse Product",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Product": {
+      "main": [
+        [
+          {
+            "node": "AI: Generate Meta",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI: Generate Meta": {
+      "main": [
+        [
+          {
+            "node": "Parse Meta",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Meta": {
+      "main": [
+        [
+          {
+            "node": "Store Meta Tags",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Update Shopify",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Store Meta Tags": {
+      "main": [
+        [
+          {
+            "node": "Notify Slack",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update Shopify": {
+      "main": [
+        [
+          {
+            "node": "Notify Slack",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true
+  },
+  "tags": ["d2c", "scale", "seo", "meta-tags"],
+  "pinData": {}
+}

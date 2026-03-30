@@ -1,0 +1,295 @@
+{
+  "name": "S-04: CEO / Operator Assistant Agent",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "s04-ceo-assist",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-trigger",
+      "name": "Webhook: Incident Alert",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [250, 300],
+      "webhookId": "s04-ceo-assist"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse incident data\nconst input = $input.first().json.body || $input.first().json;\n\nreturn [{\n  json: {\n    incident_type: input.incident_type || 'general',\n    severity: input.severity || 'medium',\n    affected_systems: input.affected_systems || [],\n    customer_impact: input.customer_impact || 'unknown',\n    description: input.description || '',\n    reported_by: input.reported_by || 'system',\n    related_incidents: input.related_incidents || 0,\n    timestamp: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "code-parse",
+      "name": "Parse Incident",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [450, 300]
+    },
+    {
+      "parameters": {
+        "operation": "select",
+        "tableId": "team_availability",
+        "filters": {
+          "conditions": [
+            {
+              "column": "status",
+              "condition": "eq",
+              "value": "available"
+            }
+          ]
+        }
+      },
+      "id": "supabase-team",
+      "name": "Get Team Status",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [650, 200],
+      "credentials": {
+        "supabaseApi": {
+          "id": "YOUR_SUPABASE_CREDENTIAL_ID",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "model": "gpt-4o",
+        "options": {},
+        "messages": {
+          "message": [
+            {
+              "role": "system",
+              "content": "You are an executive assistant. Create executive brief: 1) One-sentence summary, 2) Key facts (3 bullet points), 3) Three action options with pros/cons, 4) Recommended action. Be concise. Decision-maker has 30 seconds. Options must be executable with one tap."
+            },
+            {
+              "role": "user",
+              "content": "=Incident: {{ $json.incident_type }}\nSeverity: {{ $json.severity }}\nSystems: {{ $json.affected_systems.join(', ') }}\nImpact: {{ $json.customer_impact }}\nDescription: {{ $json.description }}\nRelated incidents: {{ $json.related_incidents }}\n\nReturn JSON:\n{\"summary\": \"string\", \"key_facts\": [\"string\", \"string\", \"string\"], \"options\": [{\"label\": \"string\", \"action\": \"string\", \"pros\": \"string\", \"cons\": \"string\"}], \"recommended\": \"string\"}"
+            }
+          ]
+        }
+      },
+      "id": "openai-brief",
+      "name": "AI: Create Brief",
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1,
+      "position": [850, 300],
+      "credentials": {
+        "openAiApi": {
+          "id": "YOUR_OPENAI_CREDENTIAL_ID",
+          "name": "OpenAI account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse AI brief\nconst aiResponse = $input.first().json.content;\nlet brief;\n\ntry {\n  brief = JSON.parse(aiResponse);\n} catch (e) {\n  brief = {\n    summary: 'Incident requires attention',\n    key_facts: ['System affected', 'Impact unknown', 'Team notified'],\n    options: [\n      { label: 'Investigate', action: 'investigate', pros: 'Quick response', cons: 'May need escalation' },\n      { label: 'Escalate', action: 'escalate', pros: 'Expert handling', cons: 'Longer response time' },\n      { label: 'Monitor', action: 'monitor', pros: 'No disruption', cons: 'Risk of escalation' }\n    ],\n    recommended: 'Investigate'\n  };\n}\n\nconst incident = $input.all()[0].json;\nconst team = $input.all()[1]?.json || [];\n\nreturn [{\n  json: {\n    alert_id: 'CEO-' + Date.now(),\n    incident_type: incident.incident_type,\n    severity: incident.severity,\n    summary: brief.summary,\n    key_facts: brief.key_facts,\n    action_options: brief.options,\n    recommended_action: brief.recommended,\n    one_tap_commands: {\n      '1': brief.options[0]?.action || 'investigate',\n      '2': brief.options[1]?.action || 'escalate',\n      '3': brief.options[2]?.action || 'monitor'\n    },\n    team_available: team.length,\n    audit_log_id: 'AUDIT-' + Date.now(),\n    timestamp: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "code-process",
+      "name": "Process Brief",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1050, 300]
+    },
+    {
+      "parameters": {
+        "phoneNumber": "={{ $env.CEO_PHONE_NUMBER }}",
+        "text": "=🚨 INCIDENT ALERT\n\n{{ $json.summary }}\n\n📊 Key Facts:\n• {{ $json.key_facts[0] }}\n• {{ $json.key_facts[1] }}\n• {{ $json.key_facts[2] }}\n\n💡 Options:\n1️⃣ {{ $json.action_options[0].label }}\n2️⃣ {{ $json.action_options[1].label }}\n3️⃣ {{ $json.action_options[2].label }}\n\n✅ Recommended: {{ $json.recommended_action }}\n\nReply 1, 2, or 3 to execute.\nAudit: {{ $json.audit_log_id }}",
+        "additionalFields": {}
+      },
+      "id": "whatsapp-send",
+      "name": "Send WhatsApp Alert",
+      "type": "n8n-nodes-base.whatsApp",
+      "typeVersion": 1,
+      "position": [1250, 200],
+      "credentials": {
+        "whatsAppApi": {
+          "id": "YOUR_WHATSAPP_CREDENTIAL_ID",
+          "name": "WhatsApp account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "channel": "=#incidents",
+        "text": "=🚨 INCIDENT ALERT SENT TO CEO\n\nType: {{ $json.incident_type }}\nSeverity: {{ $json.severity }}\nSummary: {{ $json.summary }}\n\nRecommended: {{ $json.recommended_action }}\nAudit ID: {{ $json.audit_log_id }}",
+        "otherOptions": {}
+      },
+      "id": "slack-notify",
+      "name": "Notify Slack",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [1250, 400],
+      "credentials": {
+        "slackApi": {
+          "id": "YOUR_SLACK_CREDENTIAL_ID",
+          "name": "Slack account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "tableId": "incident_alerts",
+        "fields": [
+          {
+            "fieldId": "alert_id",
+            "value": "={{ $json.alert_id }}"
+          },
+          {
+            "fieldId": "incident_type",
+            "value": "={{ $json.incident_type }}"
+          },
+          {
+            "fieldId": "severity",
+            "value": "={{ $json.severity }}"
+          },
+          {
+            "fieldId": "summary",
+            "value": "={{ $json.summary }}"
+          },
+          {
+            "fieldId": "recommended_action",
+            "value": "={{ $json.recommended_action }}"
+          },
+          {
+            "fieldId": "audit_log_id",
+            "value": "={{ $json.audit_log_id }}"
+          },
+          {
+            "fieldId": "created_at",
+            "value": "={{ $json.timestamp }}"
+          }
+        ]
+      },
+      "id": "supabase-log",
+      "name": "Log Alert",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [1450, 300],
+      "credentials": {
+        "supabaseApi": {
+          "id": "YOUR_SUPABASE_CREDENTIAL_ID",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "json": "={\"status\": \"alert_sent\", \"alert_id\": \"{{ $json.alert_id }}\", \"audit_log_id\": \"{{ $json.audit_log_id }}\"}",
+        "options": {}
+      },
+      "id": "webhook-response",
+      "name": "Return Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1650, 300]
+    }
+  ],
+  "connections": {
+    "Webhook: Incident Alert": {
+      "main": [
+        [
+          {
+            "node": "Parse Incident",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Incident": {
+      "main": [
+        [
+          {
+            "node": "Get Team Status",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "AI: Create Brief",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Team Status": {
+      "main": [
+        [
+          {
+            "node": "AI: Create Brief",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI: Create Brief": {
+      "main": [
+        [
+          {
+            "node": "Process Brief",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Process Brief": {
+      "main": [
+        [
+          {
+            "node": "Send WhatsApp Alert",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Notify Slack",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send WhatsApp Alert": {
+      "main": [
+        [
+          {
+            "node": "Log Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify Slack": {
+      "main": [
+        [
+          {
+            "node": "Log Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Alert": {
+      "main": [
+        [
+          {
+            "node": "Return Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true
+  },
+  "tags": ["d2c", "support", "ceo", "incident"],
+  "pinData": {}
+}

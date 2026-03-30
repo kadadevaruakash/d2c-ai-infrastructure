@@ -1,0 +1,270 @@
+{
+  "name": "A-02: Cold Email Outreach Agent",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "expression": "0 9 * * *"
+            }
+          ]
+        }
+      },
+      "id": "schedule-trigger",
+      "name": "Schedule: Daily 9 AM",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1,
+      "position": [250, 300]
+    },
+    {
+      "parameters": {
+        "operation": "select",
+        "tableId": "prospects",
+        "filters": {
+          "conditions": [
+            {
+              "column": "email_sent",
+              "condition": "eq",
+              "value": "false"
+            },
+            {
+              "column": "status",
+              "condition": "eq",
+              "value": "active"
+            }
+          ],
+          "limit": 50
+        }
+      },
+      "id": "supabase-fetch",
+      "name": "Fetch Prospects",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [450, 300],
+      "credentials": {
+        "supabaseApi": {
+          "id": "YOUR_SUPABASE_CREDENTIAL_ID",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {},
+      "id": "split-batch",
+      "name": "Split in Batches",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [650, 300]
+    },
+    {
+      "parameters": {
+        "model": "gpt-4o-mini",
+        "options": {},
+        "messages": {
+          "message": [
+            {
+              "role": "system",
+              "content": "You are a B2B sales copywriter. Write a 3-sentence cold email: 1) Personalized icebreaker from recent activity, 2) Value proposition, 3) Soft CTA for 15-min call. Max 120 words. No buzzwords."
+            },
+            {
+              "role": "user",
+              "content": "=Prospect: {{ $json.name }}\nTitle: {{ $json.title }}\nCompany: {{ $json.company }}\nIndustry: {{ $json.industry }}\nRecent Activity: {{ $json.recent_activity }}\nPain Points: {{ $json.pain_points }}\n\nReturn JSON:\n{\"subject\": \"string\", \"body\": \"string\"}"
+            }
+          ]
+        }
+      },
+      "id": "openai-write",
+      "name": "AI: Write Email",
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1,
+      "position": [850, 300],
+      "credentials": {
+        "openAiApi": {
+          "id": "YOUR_OPENAI_CREDENTIAL_ID",
+          "name": "OpenAI account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse AI response\nconst aiResponse = $input.first().json.content;\nlet email;\n\ntry {\n  email = JSON.parse(aiResponse);\n} catch (e) {\n  email = {\n    subject: 'Quick question about ' + $input.all()[0].json.company,\n    body: aiResponse\n  };\n}\n\nconst prospect = $input.all()[0].json;\n\nreturn [{\n  json: {\n    prospect_id: prospect.id,\n    to: prospect.email,\n    name: prospect.name,\n    subject: email.subject,\n    body: email.body,\n    company: prospect.company\n  }\n}];"
+      },
+      "id": "code-parse",
+      "name": "Parse Email",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1050, 300]
+    },
+    {
+      "parameters": {
+        "sendOptions": "=options",
+        "fromEmail": "={{ $env.BREVO_FROM_EMAIL }}",
+        "toEmail": "={{ $json.to }}",
+        "subject": "={{ $json.subject }}",
+        "html": "=<p>Hi {{ $json.name }},</p><p>{{ $json.body }}</p><p>Best regards,<br>Your Name</p>",
+        "options": {}
+      },
+      "id": "brevo-send",
+      "name": "Send via Brevo",
+      "type": "n8n-nodes-base.sendInBlue",
+      "typeVersion": 1,
+      "position": [1250, 200],
+      "credentials": {
+        "sendInBlueApi": {
+          "id": "YOUR_BREVO_CREDENTIAL_ID",
+          "name": "Brevo account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "tableId": "prospects",
+        "filters": {
+          "conditions": [
+            {
+              "column": "id",
+              "condition": "eq",
+              "value": "={{ $json.prospect_id }}"
+            }
+          ]
+        },
+        "fields": [
+          {
+            "fieldId": "email_sent",
+            "value": "true"
+          },
+          {
+            "fieldId": "sent_at",
+            "value": "={{ $now }}"
+          },
+          {
+            "fieldId": "email_subject",
+            "value": "={{ $json.subject }}"
+          }
+        ]
+      },
+      "id": "supabase-update",
+      "name": "Mark as Sent",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [1450, 300],
+      "credentials": {
+        "supabaseApi": {
+          "id": "YOUR_SUPABASE_CREDENTIAL_ID",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "channel": "=#outreach",
+        "text": "=📧 Cold Email Sent\n\nTo: {{ $json.name }} ({{ $json.company }})\nSubject: {{ $json.subject }}\n\nBatch progress: {{ $input.all().length }} sent today",
+        "otherOptions": {}
+      },
+      "id": "slack-notify",
+      "name": "Notify Slack",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [1650, 300],
+      "credentials": {
+        "slackApi": {
+          "id": "YOUR_SLACK_CREDENTIAL_ID",
+          "name": "Slack account"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Schedule: Daily 9 AM": {
+      "main": [
+        [
+          {
+            "node": "Fetch Prospects",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Prospects": {
+      "main": [
+        [
+          {
+            "node": "Split in Batches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split in Batches": {
+      "main": [
+        [
+          {
+            "node": "AI: Write Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI: Write Email": {
+      "main": [
+        [
+          {
+            "node": "Parse Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Email": {
+      "main": [
+        [
+          {
+            "node": "Send via Brevo",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Mark as Sent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send via Brevo": {
+      "main": [
+        [
+          {
+            "node": "Notify Slack",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark as Sent": {
+      "main": [
+        [
+          {
+            "node": "Split in Batches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true
+  },
+  "tags": ["d2c", "acquire", "cold-email", "scheduled"],
+  "pinData": {}
+}

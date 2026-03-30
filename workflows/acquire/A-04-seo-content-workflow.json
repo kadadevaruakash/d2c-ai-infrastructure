@@ -1,0 +1,268 @@
+{
+  "name": "A-04: SEO & Content Distribution Agent",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "expression": "0 8 * * 1"
+            }
+          ]
+        }
+      },
+      "id": "schedule-trigger",
+      "name": "Schedule: Weekly Mon 8 AM",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1,
+      "position": [250, 300]
+    },
+    {
+      "parameters": {
+        "operation": "select",
+        "tableId": "content_keywords",
+        "filters": {
+          "conditions": [
+            {
+              "column": "status",
+              "condition": "eq",
+              "value": "pending"
+            }
+          ],
+          "limit": 1
+        }
+      },
+      "id": "supabase-keyword",
+      "name": "Get Target Keyword",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [450, 300],
+      "credentials": {
+        "supabaseApi": {
+          "id": "YOUR_SUPABASE_CREDENTIAL_ID",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "model": "gpt-4o",
+        "options": {},
+        "messages": {
+          "message": [
+            {
+              "role": "system",
+              "content": "You are an SEO content strategist. Write a 1500-word SEO-optimized blog post with compelling headline, intro with hook, H2 sections, product mentions, strong CTA. Keyword density 1-2%. Include 3 internal links. Meta description max 160 chars."
+            },
+            {
+              "role": "user",
+              "content": "=Target keyword: {{ $json.keyword }}\nSearch volume: {{ $json.volume }}\nDifficulty: {{ $json.difficulty }}\n\nReturn format:\nTITLE: [title]\nMETA: [meta description]\nCONTENT:\n[full blog post with H2 sections]\nCTA: [call to action]"
+            }
+          ]
+        }
+      },
+      "id": "openai-write",
+      "name": "AI: Write Blog Post",
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1,
+      "position": [650, 300],
+      "credentials": {
+        "openAiApi": {
+          "id": "YOUR_OPENAI_CREDENTIAL_ID",
+          "name": "OpenAI account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse blog post\nconst aiResponse = $input.first().json.content;\nconst keyword = $input.all()[0].json.keyword;\n\n// Extract sections\nconst titleMatch = aiResponse.match(/TITLE:\\s*(.+)/);\nconst metaMatch = aiResponse.match(/META:\\s*(.+)/);\nconst contentMatch = aiResponse.match(/CONTENT:\\s*([\\s\\S]+?)(?=CTA:|$)/);\nconst ctaMatch = aiResponse.match(/CTA:\\s*(.+)/);\n\nconst title = titleMatch ? titleMatch[1].trim() : 'Blog Post';\nconst metaDescription = metaMatch ? metaMatch[1].trim() : '';\nconst content = contentMatch ? contentMatch[1].trim() : aiResponse;\nconst cta = ctaMatch ? ctaMatch[1].trim() : '';\n\n// Generate social snippets\nconst snippets = [\n  content.substring(0, 150) + '...',\n  `New blog: ${title}`,\n  `Learn about ${keyword} in our latest guide!`\n];\n\nreturn [{\n  json: {\n    keyword: keyword,\n    title: title,\n    meta_description: metaDescription,\n    content: content,\n    cta: cta,\n    word_count: content.split(/\\s+/).length,\n    social_snippets: snippets,\n    email_subject: `New on the blog: ${title}`,\n    created_at: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "code-parse",
+      "name": "Parse Content",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [850, 300]
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "tableId": "blog_posts",
+        "fields": [
+          {
+            "fieldId": "title",
+            "value": "={{ $json.title }}"
+          },
+          {
+            "fieldId": "content",
+            "value": "={{ $json.content }}"
+          },
+          {
+            "fieldId": "meta_description",
+            "value": "={{ $json.meta_description }}"
+          },
+          {
+            "fieldId": "keyword",
+            "value": "={{ $json.keyword }}"
+          },
+          {
+            "fieldId": "word_count",
+            "value": "={{ $json.word_count }}"
+          },
+          {
+            "fieldId": "status",
+            "value": "draft"
+          },
+          {
+            "fieldId": "created_at",
+            "value": "={{ $json.created_at }}"
+          }
+        ]
+      },
+      "id": "supabase-store",
+      "name": "Store Blog Post",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [1050, 200],
+      "credentials": {
+        "supabaseApi": {
+          "id": "YOUR_SUPABASE_CREDENTIAL_ID",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "tableId": "content_keywords",
+        "filters": {
+          "conditions": [
+            {
+              "column": "keyword",
+              "condition": "eq",
+              "value": "={{ $json.keyword }}"
+            }
+          ]
+        },
+        "fields": [
+          {
+            "fieldId": "status",
+            "value": "completed"
+          },
+          {
+            "fieldId": "completed_at",
+            "value": "={{ $now }}"
+          }
+        ]
+      },
+      "id": "supabase-update",
+      "name": "Mark Keyword Done",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [1050, 400],
+      "credentials": {
+        "supabaseApi": {
+          "id": "YOUR_SUPABASE_CREDENTIAL_ID",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "channel": "=#content-team",
+        "text": "=📝 NEW BLOG POST READY\n\nTitle: {{ $json.title }}\nKeyword: {{ $json.keyword }}\nWord Count: {{ $json.word_count }}\n\nSocial Snippets:\n1. {{ $json.social_snippets[0] }}\n2. {{ $json.social_snippets[1] }}\n3. {{ $json.social_snippets[2] }}\n\nEmail Subject: {{ $json.email_subject }}\n\nStatus: Draft (ready for review)",
+        "otherOptions": {}
+      },
+      "id": "slack-notify",
+      "name": "Notify Slack",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [1250, 300],
+      "credentials": {
+        "slackApi": {
+          "id": "YOUR_SLACK_CREDENTIAL_ID",
+          "name": "Slack account"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Schedule: Weekly Mon 8 AM": {
+      "main": [
+        [
+          {
+            "node": "Get Target Keyword",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Target Keyword": {
+      "main": [
+        [
+          {
+            "node": "AI: Write Blog Post",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI: Write Blog Post": {
+      "main": [
+        [
+          {
+            "node": "Parse Content",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Content": {
+      "main": [
+        [
+          {
+            "node": "Store Blog Post",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Mark Keyword Done",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Store Blog Post": {
+      "main": [
+        [
+          {
+            "node": "Notify Slack",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark Keyword Done": {
+      "main": [
+        [
+          {
+            "node": "Notify Slack",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true
+  },
+  "tags": ["d2c", "acquire", "seo", "content", "scheduled"],
+  "pinData": {}
+}

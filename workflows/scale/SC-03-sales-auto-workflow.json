@@ -1,0 +1,333 @@
+{
+  "name": "SC-03: Sales Automation Agent",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "sc03-sales-auto",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-trigger",
+      "name": "Webhook: Intent Signal",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [250, 300],
+      "webhookId": "sc03-sales-auto"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse intent signal\nconst input = $input.first().json.body || $input.first().json;\n\nconst intentSignals = {\n  high: ['pricing', 'demo', 'compare', 'discount', 'buy', 'purchase'],\n  medium: ['features', 'integration', 'case study', 'how it works'],\n  low: ['general question', 'careers', 'press']\n};\n\nconst message = input.message || input.text || '';\nconst detectedIntent = intentSignals.high.find(s => message.toLowerCase().includes(s)) ? 'high' :\n                       intentSignals.medium.find(s => message.toLowerCase().includes(s)) ? 'medium' : 'low';\n\nreturn [{\n  json: {\n    signal_type: input.signal_type || 'chat',\n    customer_id: input.customer_id,\n    channel: input.channel || 'chat',\n    message: message,\n    detected_intent: detectedIntent,\n    products_viewed: input.products_viewed || [],\n    time_on_page: input.time_on_page || 0,\n    timestamp: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "code-parse",
+      "name": "Parse Intent",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [450, 300]
+    },
+    {
+      "parameters": {
+        "operation": "select",
+        "tableId": "customers",
+        "filters": {
+          "conditions": [
+            {
+              "column": "id",
+              "condition": "eq",
+              "value": "={{ $json.customer_id }}"
+            }
+          ]
+        }
+      },
+      "id": "supabase-customer",
+      "name": "Get Customer",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [650, 300],
+      "credentials": {
+        "supabaseApi": {
+          "id": "YOUR_SUPABASE_CREDENTIAL_ID",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "model": "gpt-4o-mini",
+        "options": {},
+        "messages": {
+          "message": [
+            {
+              "role": "system",
+              "content": "You are a sales development representative. Qualify intent level, determine next best action, write personalized follow-up with clear CTA. High intent = immediate response + Calendly. Medium = case study + nurture. Low = add to nurture. Return JSON."
+            },
+            {
+              "role": "user",
+              "content": "=Signal: {{ $json.signal_type }}\nCustomer: {{ $json.customer_id }}\nIntent: {{ $json.detected_intent }}\nProducts viewed: {{ $json.products_viewed.join(', ') }}\nTime on page: {{ $json.time_on_page }}s\n\nReturn JSON:\n{\"intent_level\": \"high|medium|low\", \"next_action\": \"string\", \"message\": \"string\", \"follow_up_delay\": \"string\", \"priority\": \"high|medium|low\"}"
+            }
+          ]
+        }
+      },
+      "id": "openai-qualify",
+      "name": "AI: Qualify Intent",
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1,
+      "position": [850, 300],
+      "credentials": {
+        "openAiApi": {
+          "id": "YOUR_OPENAI_CREDENTIAL_ID",
+          "name": "OpenAI account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Process qualification\nconst aiResponse = $input.first().json.content;\nconst signal = $input.all()[0].json;\nconst customer = $input.all()[1]?.json?.[0] || {};\n\nlet qualification;\ntry {\n  qualification = JSON.parse(aiResponse);\n} catch (e) {\n  qualification = {\n    intent_level: signal.detected_intent,\n    next_action: 'nurture',\n    message: 'Thanks for your interest!',\n    follow_up_delay: '3 days',\n    priority: 'medium'\n  };\n}\n\n// Determine follow-up sequence\nconst sequences = {\n  high: { delay: 'immediate', next: '24h', then: '72h' },\n  medium: { delay: 'immediate', next: '3 days', then: '7 days' },\n  low: { delay: 'weekly', next: '7 days', then: '14 days' }\n};\n\nreturn [{\n  json: {\n    automation_id: 'SALE-' + Date.now(),\n    customer_id: signal.customer_id,\n    customer_email: customer.email,\n    customer_phone: customer.phone,\n    intent_level: qualification.intent_level,\n    signal_type: signal.signal_type,\n    next_action: qualification.next_action,\n    message: qualification.message,\n    follow_up_sequence: sequences[qualification.intent_level],\n    priority: qualification.priority,\n    calendly_booked: qualification.intent_level === 'high',\n    follow_up_scheduled: new Date(Date.now() + 86400000).toISOString(),\n    timestamp: signal.timestamp\n  }\n}];"
+      },
+      "id": "code-process",
+      "name": "Process Qualification",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1050, 300]
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "tableId": "sales_automation",
+        "fields": [
+          {
+            "fieldId": "automation_id",
+            "value": "={{ $json.automation_id }}"
+          },
+          {
+            "fieldId": "customer_id",
+            "value": "={{ $json.customer_id }}"
+          },
+          {
+            "fieldId": "intent_level",
+            "value": "={{ $json.intent_level }}"
+          },
+          {
+            "fieldId": "next_action",
+            "value": "={{ $json.next_action }}"
+          },
+          {
+            "fieldId": "priority",
+            "value": "={{ $json.priority }}"
+          },
+          {
+            "fieldId": "status",
+            "value": "active"
+          },
+          {
+            "fieldId": "created_at",
+            "value": "={{ $json.timestamp }}"
+          }
+        ]
+      },
+      "id": "supabase-store",
+      "name": "Store Automation",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [1250, 200],
+      "credentials": {
+        "supabaseApi": {
+          "id": "YOUR_SUPABASE_CREDENTIAL_ID",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "condition-1",
+              "leftValue": "={{ $json.intent_level }}",
+              "rightValue": "high",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "if-high",
+      "name": "High Intent?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1250, 400]
+    },
+    {
+      "parameters": {
+        "sendOptions": "=options",
+        "fromEmail": "={{ $env.BREVO_FROM_EMAIL }}",
+        "toEmail": "={{ $json.customer_email }}",
+        "subject": "=Let's chat about your needs",
+        "html": "=<p>Hi there,</p><p>{{ $json.message }}</p><p>I'd love to show you how we can help. Book a quick 15-min call: <a href='https://calendly.com/yourname/15min'>Book Now</a></p>",
+        "options": {}
+      },
+      "id": "brevo-send",
+      "name": "Send Email",
+      "type": "n8n-nodes-base.sendInBlue",
+      "typeVersion": 1,
+      "position": [1450, 350],
+      "credentials": {
+        "sendInBlueApi": {
+          "id": "YOUR_BREVO_CREDENTIAL_ID",
+          "name": "Brevo account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "channel": "=#sales-alerts",
+        "text": "=⚡ HIGH INTENT LEAD\n\nCustomer: {{ $json.customer_id }}\nIntent: {{ $json.intent_level }}\nSignal: {{ $json.signal_type }}\nPriority: {{ $json.priority }}\n\nAction: {{ $json.next_action }}\nFollow-up: {{ $json.follow_up_sequence.delay }}",
+        "otherOptions": {}
+      },
+      "id": "slack-notify",
+      "name": "Notify Slack",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [1650, 300],
+      "credentials": {
+        "slackApi": {
+          "id": "YOUR_SLACK_CREDENTIAL_ID",
+          "name": "Slack account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "json": "={\"status\": \"qualified\", \"intent_level\": \"{{ $json.intent_level }}\", \"next_action\": \"{{ $json.next_action }}\"}",
+        "options": {}
+      },
+      "id": "webhook-response",
+      "name": "Return Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1850, 300]
+    }
+  ],
+  "connections": {
+    "Webhook: Intent Signal": {
+      "main": [
+        [
+          {
+            "node": "Parse Intent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Intent": {
+      "main": [
+        [
+          {
+            "node": "Get Customer",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Customer": {
+      "main": [
+        [
+          {
+            "node": "AI: Qualify Intent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI: Qualify Intent": {
+      "main": [
+        [
+          {
+            "node": "Process Qualification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Process Qualification": {
+      "main": [
+        [
+          {
+            "node": "Store Automation",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "High Intent?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "High Intent?": {
+      "main": [
+        [
+          {
+            "node": "Send Email",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "Store Automation": {
+      "main": [
+        [
+          {
+            "node": "Notify Slack",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Email": {
+      "main": [
+        [
+          {
+            "node": "Notify Slack",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify Slack": {
+      "main": [
+        [
+          {
+            "node": "Return Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true
+  },
+  "tags": ["d2c", "scale", "sales", "intent"],
+  "pinData": {}
+}

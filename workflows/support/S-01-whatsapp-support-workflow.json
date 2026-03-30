@@ -1,0 +1,375 @@
+{
+  "name": "S-01: WhatsApp D2C Customer Support Agent",
+  "nodes": [
+    {
+      "parameters": {
+        "events": [
+          "messages"
+        ],
+        "options": {}
+      },
+      "id": "whatsapp-trigger",
+      "name": "WhatsApp: New Message",
+      "type": "n8n-nodes-base.whatsAppTrigger",
+      "typeVersion": 1,
+      "position": [250, 300],
+      "credentials": {
+        "whatsAppApi": {
+          "id": "YOUR_WHATSAPP_CREDENTIAL_ID",
+          "name": "WhatsApp account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse WhatsApp webhook payload\nconst message = $input.first().json;\n\nreturn [{\n  json: {\n    message_id: message.id || message.messages?.[0]?.id,\n    from: message.from || message.messages?.[0]?.from,\n    message_body: message.text?.body || message.messages?.[0]?.text?.body,\n    timestamp: message.timestamp || Date.now(),\n    profile_name: message.contacts?.[0]?.profile?.name || 'Customer',\n    message_type: message.type || 'text'\n  }\n}];"
+      },
+      "id": "code-parse",
+      "name": "Parse Message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [450, 300]
+    },
+    {
+      "parameters": {
+        "operation": "select",
+        "tableId": "customers",
+        "filters": {
+          "conditions": [
+            {
+              "column": "phone",
+              "condition": "eq",
+              "value": "={{ $json.from }}"
+            }
+          ]
+        }
+      },
+      "id": "supabase-customer",
+      "name": "Get Customer Data",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [650, 200],
+      "credentials": {
+        "supabaseApi": {
+          "id": "YOUR_SUPABASE_CREDENTIAL_ID",
+          "name": "Supabase account"
+        }
+      },
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "operation": "select",
+        "tableId": "support_tickets",
+        "filters": {
+          "conditions": [
+            {
+              "column": "customer_phone",
+              "condition": "eq",
+              "value": "={{ $json.from }}"
+            }
+          ],
+          "limit": 5
+        }
+      },
+      "id": "supabase-history",
+      "name": "Get Chat History",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [650, 400],
+      "credentials": {
+        "supabaseApi": {
+          "id": "YOUR_SUPABASE_CREDENTIAL_ID",
+          "name": "Supabase account"
+        }
+      },
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// Merge customer data and history\nconst message = $input.all()[0].json;\nconst customerData = $input.all()[1]?.json?.[0] || {};\nconst history = $input.all()[2]?.json || [];\n\nconst customer = {\n  id: customerData.id || 'NEW',\n  name: customerData.name || message.profile_name,\n  phone: message.from,\n  tier: customerData.vip_tier || 'regular',\n  ltv: customerData.lifetime_value || 0,\n  order_count: customerData.order_count || 0\n};\n\nconst context = history.map(h => h.message).join('\\n');\n\nreturn [{\n  json: {\n    ...message,\n    customer,\n    chat_history: context,\n    is_vip: customer.tier === 'vip',\n    is_new: customer.order_count === 0\n  }\n}];"
+      },
+      "id": "code-merge",
+      "name": "Merge Context",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [850, 300]
+    },
+    {
+      "parameters": {
+        "model": "gpt-4o-mini",
+        "options": {},
+        "messages": {
+          "message": [
+            {
+              "role": "system",
+              "content": "You are a customer support agent for a D2C brand on WhatsApp. Classify intent (order_status/refund/product_question/complaint/general), check if answerable, generate appropriate response. VIP = warm personal tone. Complaint = empathetic. Keep under 3 sentences for WhatsApp. Return ONLY valid JSON."
+            },
+            {
+              "role": "user",
+              "content": "=Customer: {{ $json.customer.name }}\nTier: {{ $json.customer.tier }}\nLTV: ${{ $json.customer.ltv }}\nOrders: {{ $json.customer.order_count }}\n\nMessage: \"{{ $json.message_body }}\"\n\nChat History:\n{{ $json.chat_history }}\n\nReturn JSON:\n{\"intent\": \"string\", \"answerable\": boolean, \"response\": \"string\", \"escalate\": boolean, \"escalation_reason\": \"string\"}"
+            }
+          ]
+        }
+      },
+      "id": "openai-classify",
+      "name": "AI: Classify & Respond",
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1,
+      "position": [1050, 300],
+      "credentials": {
+        "openAiApi": {
+          "id": "YOUR_OPENAI_CREDENTIAL_ID",
+          "name": "OpenAI account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse AI response\nconst aiResponse = $input.first().json.content;\nlet result;\n\ntry {\n  result = JSON.parse(aiResponse);\n} catch (e) {\n  result = {\n    intent: 'general',\n    answerable: true,\n    response: 'Thank you for reaching out. Let me help you with that.',\n    escalate: false\n  };\n}\n\nconst context = $input.all()[0].json;\n\nreturn [{\n  json: {\n    message_id: context.message_id,\n    customer_phone: context.from,\n    customer_name: context.customer.name,\n    intent: result.intent,\n    response: result.response,\n    escalate: result.escalate,\n    escalation_reason: result.escalation_reason,\n    answerable: result.answerable,\n    is_vip: context.is_vip,\n    timestamp: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "code-process",
+      "name": "Process Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1250, 300]
+    },
+    {
+      "parameters": {
+        "phoneNumber": "={{ $json.customer_phone }}",
+        "text": "={{ $json.response }}",
+        "additionalFields": {}
+      },
+      "id": "whatsapp-send",
+      "name": "Send WhatsApp Reply",
+      "type": "n8n-nodes-base.whatsApp",
+      "typeVersion": 1,
+      "position": [1450, 200],
+      "credentials": {
+        "whatsAppApi": {
+          "id": "YOUR_WHATSAPP_CREDENTIAL_ID",
+          "name": "WhatsApp account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "condition-1",
+              "leftValue": "={{ $json.escalate }}",
+              "rightValue": "true",
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "if-escalate",
+      "name": "Escalate?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1450, 400]
+    },
+    {
+      "parameters": {
+        "channel": "=#support-escalations",
+        "text": "=🚨 ESCALATION ALERT\n\nCustomer: {{ $json.customer_name }}\nPhone: {{ $json.customer_phone }}\nVIP: {{ $json.is_vip ? 'Yes' : 'No' }}\nIntent: {{ $json.intent }}\nReason: {{ $json.escalation_reason }}\n\nOriginal message requires human attention.",
+        "otherOptions": {}
+      },
+      "id": "slack-escalate",
+      "name": "Notify Slack",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [1650, 350],
+      "credentials": {
+        "slackApi": {
+          "id": "YOUR_SLACK_CREDENTIAL_ID",
+          "name": "Slack account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "tableId": "support_interactions",
+        "fields": [
+          {
+            "fieldId": "message_id",
+            "value": "={{ $json.message_id }}"
+          },
+          {
+            "fieldId": "customer_phone",
+            "value": "={{ $json.customer_phone }}"
+          },
+          {
+            "fieldId": "intent",
+            "value": "={{ $json.intent }}"
+          },
+          {
+            "fieldId": "response",
+            "value": "={{ $json.response }}"
+          },
+          {
+            "fieldId": "escalated",
+            "value": "={{ $json.escalate }}"
+          },
+          {
+            "fieldId": "created_at",
+            "value": "={{ $json.timestamp }}"
+          }
+        ]
+      },
+      "id": "supabase-log",
+      "name": "Log Interaction",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [1850, 300],
+      "credentials": {
+        "supabaseApi": {
+          "id": "YOUR_SUPABASE_CREDENTIAL_ID",
+          "name": "Supabase account"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "WhatsApp: New Message": {
+      "main": [
+        [
+          {
+            "node": "Parse Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Message": {
+      "main": [
+        [
+          {
+            "node": "Get Customer Data",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Get Chat History",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Customer Data": {
+      "main": [
+        [
+          {
+            "node": "Merge Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Chat History": {
+      "main": [
+        [
+          {
+            "node": "Merge Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge Context": {
+      "main": [
+        [
+          {
+            "node": "AI: Classify & Respond",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI: Classify & Respond": {
+      "main": [
+        [
+          {
+            "node": "Process Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Process Response": {
+      "main": [
+        [
+          {
+            "node": "Send WhatsApp Reply",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Escalate?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Escalate?": {
+      "main": [
+        [
+          {
+            "node": "Notify Slack",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "Send WhatsApp Reply": {
+      "main": [
+        [
+          {
+            "node": "Log Interaction",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify Slack": {
+      "main": [
+        [
+          {
+            "node": "Log Interaction",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "tags": ["d2c", "support", "whatsapp"],
+  "pinData": {}
+}

@@ -1,0 +1,295 @@
+{
+  "name": "S-02: AI-Powered Support Brain (RAG)",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "s02-rag-brain",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-trigger",
+      "name": "Webhook: Support Query",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [250, 300],
+      "webhookId": "s02-rag-brain"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse incoming query\nconst input = $input.first().json.body || $input.first().json;\n\nreturn [{\n  json: {\n    query: input.query || input.message,\n    channel: input.channel || 'chat',\n    customer_id: input.customer_id,\n    session_id: input.session_id || 'session-' + Date.now(),\n    timestamp: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "code-parse",
+      "name": "Parse Query",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [450, 300]
+    },
+    {
+      "parameters": {
+        "operation": "vectorStoreSearch",
+        "options": {},
+        "prompt": "={{ $json.query }}",
+        "topK": 3
+      },
+      "id": "pinecone-search",
+      "name": "Pinecone: Search KB",
+      "type": "@n8n/n8n-nodes-langchain.vectorStorePinecone",
+      "typeVersion": 1,
+      "position": [650, 300],
+      "credentials": {
+        "pineconeApi": {
+          "id": "YOUR_PINECONE_CREDENTIAL_ID",
+          "name": "Pinecone account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "model": "gpt-4o-mini",
+        "options": {},
+        "messages": {
+          "message": [
+            {
+              "role": "system",
+              "content": "You are a knowledgeable support agent. Answer using ONLY the provided knowledge chunks. Include citations. If insufficient information, indicate low confidence. Return JSON with answer, confidence score (0-1), and sources."
+            },
+            {
+              "role": "user",
+              "content": "=Knowledge chunks: {{ $json.documents }}\n\nCustomer question: '{{ $json.query }}'\n\nReturn JSON:\n{\"answer\": \"string\", \"confidence\": number (0-1), \"sources\": [\"string\"], \"needs_escalation\": boolean}"
+            }
+          ]
+        }
+      },
+      "id": "openai-answer",
+      "name": "AI: Generate Answer",
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1,
+      "position": [850, 300],
+      "credentials": {
+        "openAiApi": {
+          "id": "YOUR_OPENAI_CREDENTIAL_ID",
+          "name": "OpenAI account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse AI response\nconst aiResponse = $input.first().json.content;\nlet result;\n\ntry {\n  result = JSON.parse(aiResponse);\n} catch (e) {\n  result = {\n    answer: aiResponse,\n    confidence: 0.5,\n    sources: [],\n    needs_escalation: false\n  };\n}\n\nconst query = $input.all()[0].json;\n\n// Determine action based on confidence\nlet action = 'send_directly';\nif (result.confidence < 0.5) {\n  action = 'escalate';\n  result.needs_escalation = true;\n} else if (result.confidence < 0.8) {\n  action = 'send_with_disclaimer';\n}\n\nreturn [{\n  json: {\n    answer_id: 'ANS-' + Date.now(),\n    query: query.query,\n    answer: result.answer,\n    confidence_score: result.confidence,\n    sources_cited: result.sources || [],\n    escalation_recommended: result.needs_escalation,\n    action: action,\n    channel: query.channel,\n    customer_id: query.customer_id,\n    retrieval_time_ms: Date.now() - new Date(query.timestamp).getTime(),\n    timestamp: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "code-process",
+      "name": "Process Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1050, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "condition-1",
+              "leftValue": "={{ $json.escalation_recommended }}",
+              "rightValue": "true",
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "if-escalate",
+      "name": "Escalate?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1250, 300]
+    },
+    {
+      "parameters": {
+        "channel": "=#support-escalations",
+        "text": "=🚨 RAG ESCALATION\n\nQuery: {{ $json.query }}\nConfidence: {{ ($json.confidence_score * 100).toFixed(0) }}%\nCustomer: {{ $json.customer_id }}\n\nLow confidence - needs human review.",
+        "otherOptions": {}
+      },
+      "id": "slack-escalate",
+      "name": "Notify Escalation",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [1450, 250],
+      "credentials": {
+        "slackApi": {
+          "id": "YOUR_SLACK_CREDENTIAL_ID",
+          "name": "Slack account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "json": "={{ JSON.stringify({ answer: $json.answer, confidence: $json.confidence_score, sources: $json.sources_cited, escalated: $json.escalation_recommended }) }}",
+        "options": {}
+      },
+      "id": "webhook-response",
+      "name": "Return Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1650, 300]
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "tableId": "rag_interactions",
+        "fields": [
+          {
+            "fieldId": "answer_id",
+            "value": "={{ $json.answer_id }}"
+          },
+          {
+            "fieldId": "query",
+            "value": "={{ $json.query }}"
+          },
+          {
+            "fieldId": "answer",
+            "value": "={{ $json.answer }}"
+          },
+          {
+            "fieldId": "confidence_score",
+            "value": "={{ $json.confidence_score }}"
+          },
+          {
+            "fieldId": "sources",
+            "value": "={{ JSON.stringify($json.sources_cited) }}"
+          },
+          {
+            "fieldId": "escalated",
+            "value": "={{ $json.escalation_recommended }}"
+          },
+          {
+            "fieldId": "created_at",
+            "value": "={{ $json.timestamp }}"
+          }
+        ]
+      },
+      "id": "supabase-log",
+      "name": "Log Interaction",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [1850, 300],
+      "credentials": {
+        "supabaseApi": {
+          "id": "YOUR_SUPABASE_CREDENTIAL_ID",
+          "name": "Supabase account"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Webhook: Support Query": {
+      "main": [
+        [
+          {
+            "node": "Parse Query",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Query": {
+      "main": [
+        [
+          {
+            "node": "Pinecone: Search KB",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pinecone: Search KB": {
+      "main": [
+        [
+          {
+            "node": "AI: Generate Answer",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI: Generate Answer": {
+      "main": [
+        [
+          {
+            "node": "Process Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Process Response": {
+      "main": [
+        [
+          {
+            "node": "Escalate?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Escalate?": {
+      "main": [
+        [
+          {
+            "node": "Notify Escalation",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Return Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify Escalation": {
+      "main": [
+        [
+          {
+            "node": "Return Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Return Response": {
+      "main": [
+        [
+          {
+            "node": "Log Interaction",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true
+  },
+  "tags": ["d2c", "support", "rag", "knowledge-base"],
+  "pinData": {}
+}

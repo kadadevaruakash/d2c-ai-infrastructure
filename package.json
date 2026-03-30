@@ -1,0 +1,27 @@
+{
+  "name": "d2c-ai-infrastructure",
+  "version": "2.0.0",
+  "description": "Plug-and-play D2C AI backend — 24 workflow modules, pure Node.js, no n8n required",
+  "main": "api/server.js",
+  "scripts": {
+    "start": "node api/server.js",
+    "dev": "nodemon api/server.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.52.0",
+    "@pinecone-database/pinecone": "^2.2.0",
+    "@slack/web-api": "^7.0.0",
+    "@supabase/supabase-js": "^2.39.0",
+    "axios": "^1.6.0",
+    "express": "^4.18.0",
+    "googleapis": "^140.0.0",
+    "node-cron": "^3.0.3",
+    "openai": "^4.28.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

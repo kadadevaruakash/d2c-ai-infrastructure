@@ -1,0 +1,424 @@
+{
+  "name": "C-01: Cart Abandonment Recovery Agent [FIXED]",
+  "nodes": [
+    {
+      "parameters": {
+        "event": "checkout_abandoned",
+        "options": {}
+      },
+      "id": "shopify-trigger",
+      "name": "Shopify: Cart Abandoned",
+      "type": "n8n-nodes-base.shopifyTrigger",
+      "typeVersion": 1,
+      "position": [250, 300],
+      "credentials": {
+        "shopifyApi": {
+          "id": "YOUR_SHOPIFY_CREDENTIAL_ID",
+          "name": "Shopify account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Extract cart data from Shopify webhook\nconst checkout = $input.first().json;\n\nconst cartValue = parseFloat(checkout.total_price || 0);\nconst items = (checkout.line_items || []).map(item => ({\n  name: item.title,\n  price: item.price,\n  quantity: item.quantity\n}));\n\nreturn [{\n  json: {\n    checkout_id: checkout.id || checkout.token,\n    customer_email: checkout.email,\n    customer_phone: checkout.phone || checkout.shipping_address?.phone,\n    cart_value: cartValue,\n    items: items,\n    item_count: items.length,\n    abandoned_at: new Date().toISOString(),\n    currency: checkout.currency || 'USD',\n    customer_id: checkout.customer?.id\n  }\n}];"
+      },
+      "id": "code-extract",
+      "name": "Extract Cart Data",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [450, 300]
+    },
+    {
+      "parameters": {
+        "model": "gpt-4o-mini",
+        "options": {},
+        "messages": {
+          "message": [
+            {
+              "role": "system",
+              "content": "You are a cart recovery specialist for a D2C brand. Determine the best channel (email/sms/whatsapp), timing (1h/4h/24h), and incentive (none/5%/10%/free_shipping) based on cart value and customer history. Return ONLY valid JSON."
+            },
+            {
+              "role": "user",
+              "content": "=Cart value: ${{ $json.cart_value }}\nItems: {{ $json.item_count }}\nCustomer ID: {{ $json.customer_id }}\nHas phone: {{ $json.customer_phone ? 'yes' : 'no' }}\n\nReturn JSON:\n{\"channel\": \"email|sms|whatsapp\", \"delay_minutes\": number, \"incentive\": \"none|5%|10%|free_shipping\", \"tone\": \"urgent|friendly|exclusive\", \"message_preview\": \"string\"}"
+            }
+          ]
+        }
+      },
+      "id": "openai-strategy",
+      "name": "AI: Recovery Strategy",
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1,
+      "position": [650, 300],
+      "credentials": {
+        "openAiApi": {
+          "id": "YOUR_OPENAI_CREDENTIAL_ID",
+          "name": "OpenAI account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse AI strategy and prepare recovery data\nconst aiResponseText = $input.first().json.content;\nlet strategy;\n\ntry {\n  const cleaned = aiResponseText.replace(/^```json\\s*/i, '').replace(/^```\\s*/i, '').replace(/```\\s*$/i, '').trim();\n  strategy = JSON.parse(cleaned);\n} catch (e) {\n  const cart = $input.all()[0].json;\n  strategy = {\n    channel: 'email',\n    delay_minutes: 60,\n    incentive: cart.cart_value > 100 ? '10%' : '5%',\n    tone: 'friendly',\n    message_preview: 'Complete your purchase'\n  };\n}\n\nconst cart = $input.all()[0].json;\nconst recoveryId = 'REC-' + Date.now();\nconst scheduledTime = new Date(Date.now() + strategy.delay_minutes * 60000).toISOString();\n\n// If AI recommends whatsapp/sms but no phone available, fall back to email\nlet channel = strategy.channel;\nif ((channel === 'whatsapp' || channel === 'sms') && !cart.customer_phone) {\n  channel = 'email';\n}\n\nreturn [{\n  json: {\n    recovery_id: recoveryId,\n    checkout_id: cart.checkout_id,\n    customer_email: cart.customer_email,\n    customer_phone: cart.customer_phone,\n    cart_value: cart.cart_value,\n    items: cart.items,\n    channel: channel,\n    delay_minutes: strategy.delay_minutes,\n    scheduled_time: scheduledTime,\n    incentive: strategy.incentive,\n    tone: strategy.tone,\n    message_preview: strategy.message_preview,\n    created_at: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "code-prepare",
+      "name": "Prepare Recovery",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [850, 300]
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "tableId": "cart_recoveries",
+        "fields": [
+          {
+            "fieldId": "recovery_id",
+            "value": "={{ $json.recovery_id }}"
+          },
+          {
+            "fieldId": "checkout_id",
+            "value": "={{ $json.checkout_id }}"
+          },
+          {
+            "fieldId": "customer_email",
+            "value": "={{ $json.customer_email }}"
+          },
+          {
+            "fieldId": "cart_value",
+            "value": "={{ $json.cart_value }}"
+          },
+          {
+            "fieldId": "channel",
+            "value": "={{ $json.channel }}"
+          },
+          {
+            "fieldId": "scheduled_time",
+            "value": "={{ $json.scheduled_time }}"
+          },
+          {
+            "fieldId": "incentive",
+            "value": "={{ $json.incentive }}"
+          },
+          {
+            "fieldId": "status",
+            "value": "scheduled"
+          }
+        ]
+      },
+      "id": "supabase-store",
+      "name": "Store Recovery Job",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [1050, 300],
+      "credentials": {
+        "supabaseApi": {
+          "id": "YOUR_SUPABASE_CREDENTIAL_ID",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "expression": "0 * * * *"
+            }
+          ]
+        }
+      },
+      "id": "schedule-check",
+      "name": "Schedule: Check Recoveries",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1,
+      "position": [250, 600]
+    },
+    {
+      "parameters": {
+        "operation": "select",
+        "tableId": "cart_recoveries",
+        "filters": {
+          "conditions": [
+            {
+              "column": "status",
+              "condition": "eq",
+              "value": "scheduled"
+            },
+            {
+              "column": "scheduled_time",
+              "condition": "lte",
+              "value": "={{ $now }}"
+            }
+          ]
+        }
+      },
+      "id": "supabase-fetch",
+      "name": "Fetch Due Recoveries",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [450, 600],
+      "credentials": {
+        "supabaseApi": {
+          "id": "YOUR_SUPABASE_CREDENTIAL_ID",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": false,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "condition-channel",
+              "leftValue": "={{ $json.channel }}",
+              "rightValue": "whatsapp",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "if-channel-whatsapp",
+      "name": "Channel: WhatsApp?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [650, 600]
+    },
+    {
+      "parameters": {
+        "phoneNumber": "={{ $json.customer_phone }}",
+        "text": "=👋 Hey! You left ${{ $json.cart_value }} in your cart.\n\n{{ $json.incentive !== 'none' ? 'Special offer just for you: ' + $json.incentive + ' off!' : 'Complete your purchase before it sells out!' }}\n\n🛒 https://yourstore.com/checkout/{{ $json.checkout_id }}",
+        "additionalFields": {}
+      },
+      "id": "whatsapp-recovery",
+      "name": "Send WhatsApp Recovery",
+      "type": "n8n-nodes-base.whatsApp",
+      "typeVersion": 1,
+      "position": [850, 500],
+      "credentials": {
+        "whatsAppApi": {
+          "id": "YOUR_WHATSAPP_CREDENTIAL_ID",
+          "name": "WhatsApp account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "sendOptions": "=options",
+        "fromEmail": "={{ $env.BREVO_FROM_EMAIL }}",
+        "toEmail": "={{ $json.customer_email }}",
+        "subject": "=You left something behind...",
+        "html": "=<h2>Complete Your Purchase</h2><p>Hi there!</p><p>You left ${{ $json.cart_value }} worth of items in your cart.</p><p>{{ $json.incentive !== 'none' ? '<strong>Special offer: ' + $json.incentive + ' off your order!</strong>' : '' }}</p><p><a href=\"https://yourstore.com/checkout\">Complete Purchase</a></p>",
+        "options": {}
+      },
+      "id": "brevo-send",
+      "name": "Send Recovery Email",
+      "type": "n8n-nodes-base.sendInBlue",
+      "typeVersion": 1,
+      "position": [850, 700],
+      "credentials": {
+        "sendInBlueApi": {
+          "id": "YOUR_BREVO_CREDENTIAL_ID",
+          "name": "Brevo account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "tableId": "cart_recoveries",
+        "filters": {
+          "conditions": [
+            {
+              "column": "recovery_id",
+              "condition": "eq",
+              "value": "={{ $json.recovery_id }}"
+            }
+          ]
+        },
+        "fields": [
+          {
+            "fieldId": "status",
+            "value": "sent"
+          },
+          {
+            "fieldId": "sent_at",
+            "value": "={{ $now }}"
+          }
+        ]
+      },
+      "id": "supabase-update-wa",
+      "name": "Mark Sent (WA)",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [1050, 500],
+      "credentials": {
+        "supabaseApi": {
+          "id": "YOUR_SUPABASE_CREDENTIAL_ID",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "tableId": "cart_recoveries",
+        "filters": {
+          "conditions": [
+            {
+              "column": "recovery_id",
+              "condition": "eq",
+              "value": "={{ $json.recovery_id }}"
+            }
+          ]
+        },
+        "fields": [
+          {
+            "fieldId": "status",
+            "value": "sent"
+          },
+          {
+            "fieldId": "sent_at",
+            "value": "={{ $now }}"
+          }
+        ]
+      },
+      "id": "supabase-update-email",
+      "name": "Mark Sent (Email)",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [1050, 700],
+      "credentials": {
+        "supabaseApi": {
+          "id": "YOUR_SUPABASE_CREDENTIAL_ID",
+          "name": "Supabase account"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Shopify: Cart Abandoned": {
+      "main": [
+        [
+          {
+            "node": "Extract Cart Data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Cart Data": {
+      "main": [
+        [
+          {
+            "node": "AI: Recovery Strategy",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI: Recovery Strategy": {
+      "main": [
+        [
+          {
+            "node": "Prepare Recovery",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Recovery": {
+      "main": [
+        [
+          {
+            "node": "Store Recovery Job",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Schedule: Check Recoveries": {
+      "main": [
+        [
+          {
+            "node": "Fetch Due Recoveries",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Due Recoveries": {
+      "main": [
+        [
+          {
+            "node": "Channel: WhatsApp?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Channel: WhatsApp?": {
+      "main": [
+        [
+          {
+            "node": "Send WhatsApp Recovery",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Send Recovery Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send WhatsApp Recovery": {
+      "main": [
+        [
+          {
+            "node": "Mark Sent (WA)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Recovery Email": {
+      "main": [
+        [
+          {
+            "node": "Mark Sent (Email)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "tags": ["d2c", "convert", "cart-recovery", "fixed"],
+  "pinData": {}
+}

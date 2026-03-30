@@ -1,0 +1,298 @@
+{
+  "name": "R-01: CRM Structuring & Follow-up Agent",
+  "nodes": [
+    {
+      "parameters": {
+        "event": "order_created",
+        "options": {}
+      },
+      "id": "shopify-trigger",
+      "name": "Shopify: Order Created",
+      "type": "n8n-nodes-base.shopifyTrigger",
+      "typeVersion": 1,
+      "position": [250, 300],
+      "credentials": {
+        "shopifyApi": {
+          "id": "YOUR_SHOPIFY_CREDENTIAL_ID",
+          "name": "Shopify account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse order data\nconst order = $input.first().json;\n\nreturn [{\n  json: {\n    order_id: order.id || order.order_id,\n    customer_id: order.customer?.id,\n    customer_email: order.email || order.customer?.email,\n    customer_name: order.customer?.first_name + ' ' + order.customer?.last_name,\n    order_value: parseFloat(order.total_price || 0),\n    products: (order.line_items || []).map(i => i.title),\n    order_date: order.created_at || new Date().toISOString(),\n    is_first_order: !order.customer?.orders_count || order.customer.orders_count <= 1\n  }\n}];"
+      },
+      "id": "code-parse",
+      "name": "Parse Order",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [450, 300]
+    },
+    {
+      "parameters": {
+        "operation": "select",
+        "tableId": "customers",
+        "filters": {
+          "conditions": [
+            {
+              "column": "email",
+              "condition": "eq",
+              "value": "={{ $json.customer_email }}"
+            }
+          ]
+        }
+      },
+      "id": "supabase-customer",
+      "name": "Get Customer History",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [650, 300],
+      "credentials": {
+        "supabaseApi": {
+          "id": "YOUR_SUPABASE_CREDENTIAL_ID",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "model": "gpt-4o-mini",
+        "options": {},
+        "messages": {
+          "message": [
+            {
+              "role": "system",
+              "content": "You are a CRM segmentation specialist. Calculate RFM score (Recency, Frequency, Monetary), assign segment (Champion/Loyal/Potential/New/At Risk/Lost), suggest next campaign. Return ONLY JSON."
+            },
+            {
+              "role": "user",
+              "content": "=Customer: {{ $json.customer_name }}\nOrder value: ${{ $json.order_value }}\nProducts: {{ $json.products.join(', ') }}\nTotal orders: {{ $json.order_count || 1 }}\nTotal spent: ${{ $json.lifetime_value || $json.order_value }}\nLast order: {{ $json.days_since_last_order || 0 }} days ago\n\nReturn JSON:\n{\"rfm\": {\"r\": 1-5, \"f\": 1-5, \"m\": 1-5}, \"segment\": \"string\", \"tags\": [\"string\"], \"next_campaign\": \"string\", \"priority\": \"high|medium|low\"}"
+            }
+          ]
+        }
+      },
+      "id": "openai-segment",
+      "name": "AI: Segment Customer",
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1,
+      "position": [850, 300],
+      "credentials": {
+        "openAiApi": {
+          "id": "YOUR_OPENAI_CREDENTIAL_ID",
+          "name": "OpenAI account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse segmentation\nconst aiResponse = $input.first().json.content;\nlet segmentation;\n\ntry {\n  segmentation = JSON.parse(aiResponse);\n} catch (e) {\n  segmentation = {\n    rfm: { r: 3, f: 3, m: 3 },\n    segment: 'Regular',\n    tags: ['active'],\n    next_campaign: 'nurture',\n    priority: 'medium'\n  };\n}\n\nconst order = $input.all()[0].json;\nconst customer = $input.all()[1]?.json?.[0] || {};\n\n// Calculate lifecycle stage\nlet lifecycle = 'new';\nconst orderCount = (customer.order_count || 0) + 1;\nif (orderCount > 10) lifecycle = 'champion';\nelse if (orderCount > 5) lifecycle = 'loyal';\nelse if (orderCount > 2) lifecycle = 'potential';\n\n// Determine next touchpoint\nconst nextTouchpoint = new Date();\nif (segmentation.segment === 'At Risk') nextTouchpoint.setDate(nextTouchpoint.getDate() + 7);\nelse if (segmentation.segment === 'Champion') nextTouchpoint.setDate(nextTouchpoint.getDate() + 30);\nelse nextTouchpoint.setDate(nextTouchpoint.getDate() + 14);\n\nreturn [{\n  json: {\n    customer_id: order.customer_id || customer.id,\n    email: order.customer_email,\n    name: order.customer_name,\n    rfm_scores: segmentation.rfm,\n    segment: segmentation.segment,\n    tags: segmentation.tags,\n    lifecycle_stage: lifecycle,\n    next_touchpoint: nextTouchpoint.toISOString(),\n    recommended_campaign: segmentation.next_campaign,\n    priority: segmentation.priority,\n    last_order_value: order.order_value,\n    total_orders: orderCount,\n    updated_at: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "code-process",
+      "name": "Process Segmentation",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1050, 300]
+    },
+    {
+      "parameters": {
+        "operation": "upsert",
+        "tableId": "customers",
+        "filters": {
+          "conditions": [
+            {
+              "column": "email",
+              "condition": "eq",
+              "value": "={{ $json.email }}"
+            }
+          ]
+        },
+        "fields": [
+          {
+            "fieldId": "name",
+            "value": "={{ $json.name }}"
+          },
+          {
+            "fieldId": "email",
+            "value": "={{ $json.email }}"
+          },
+          {
+            "fieldId": "segment",
+            "value": "={{ $json.segment }}"
+          },
+          {
+            "fieldId": "tags",
+            "value": "={{ JSON.stringify($json.tags) }}"
+          },
+          {
+            "fieldId": "lifecycle_stage",
+            "value": "={{ $json.lifecycle_stage }}"
+          },
+          {
+            "fieldId": "rfm_r",
+            "value": "={{ $json.rfm_scores.r }}"
+          },
+          {
+            "fieldId": "rfm_f",
+            "value": "={{ $json.rfm_scores.f }}"
+          },
+          {
+            "fieldId": "rfm_m",
+            "value": "={{ $json.rfm_scores.m }}"
+          },
+          {
+            "fieldId": "order_count",
+            "value": "={{ $json.total_orders }}"
+          },
+          {
+            "fieldId": "next_touchpoint",
+            "value": "={{ $json.next_touchpoint }}"
+          },
+          {
+            "fieldId": "updated_at",
+            "value": "={{ $json.updated_at }}"
+          }
+        ]
+      },
+      "id": "supabase-update",
+      "name": "Update CRM",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [1250, 200],
+      "credentials": {
+        "supabaseApi": {
+          "id": "YOUR_SUPABASE_CREDENTIAL_ID",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "sendOptions": "=options",
+        "fromEmail": "={{ $env.BREVO_FROM_EMAIL }}",
+        "toEmail": "={{ $json.email }}",
+        "subject": "=Thanks for your order, {{ $json.name.split(' ')[0] }}!",
+        "html": "=<h2>Thank you for your order!</h2><p>Hi {{ $json.name.split(' ')[0] }},</p><p>We've received your order and it's being processed.</p><p>As a {{ $json.segment }} customer, you'll get exclusive updates!</p><p>Next campaign: {{ $json.recommended_campaign }}</p>",
+        "options": {}
+      },
+      "id": "brevo-welcome",
+      "name": "Send Welcome Email",
+      "type": "n8n-nodes-base.sendInBlue",
+      "typeVersion": 1,
+      "position": [1250, 400],
+      "credentials": {
+        "sendInBlueApi": {
+          "id": "YOUR_BREVO_CREDENTIAL_ID",
+          "name": "Brevo account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "channel": "=#crm-updates",
+        "text": "=📊 CRM UPDATED\n\nCustomer: {{ $json.name }}\nSegment: {{ $json.segment }}\nLifecycle: {{ $json.lifecycle_stage }}\nRFM: R{{ $json.rfm_scores.r }} F{{ $json.rfm_scores.f }} M{{ $json.rfm_scores.m }}\nNext touchpoint: {{ $json.next_touchpoint }}\nCampaign: {{ $json.recommended_campaign }}",
+        "otherOptions": {}
+      },
+      "id": "slack-notify",
+      "name": "Notify Slack",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [1450, 300],
+      "credentials": {
+        "slackApi": {
+          "id": "YOUR_SLACK_CREDENTIAL_ID",
+          "name": "Slack account"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Shopify: Order Created": {
+      "main": [
+        [
+          {
+            "node": "Parse Order",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Order": {
+      "main": [
+        [
+          {
+            "node": "Get Customer History",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Customer History": {
+      "main": [
+        [
+          {
+            "node": "AI: Segment Customer",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI: Segment Customer": {
+      "main": [
+        [
+          {
+            "node": "Process Segmentation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Process Segmentation": {
+      "main": [
+        [
+          {
+            "node": "Update CRM",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Send Welcome Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update CRM": {
+      "main": [
+        [
+          {
+            "node": "Notify Slack",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Welcome Email": {
+      "main": [
+        [
+          {
+            "node": "Notify Slack",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true
+  },
+  "tags": ["d2c", "retain", "crm", "segmentation"],
+  "pinData": {}
+}

@@ -1,0 +1,294 @@
+{
+  "name": "C-04: Gamified Checkout Agent [FIXED]",
+  "nodes": [
+    {
+      "parameters": {
+        "event": "checkout_started",
+        "options": {}
+      },
+      "id": "shopify-trigger",
+      "name": "Shopify: Checkout Started",
+      "type": "n8n-nodes-base.shopifyTrigger",
+      "typeVersion": 1,
+      "position": [250, 300],
+      "credentials": {
+        "shopifyApi": {
+          "id": "YOUR_SHOPIFY_CREDENTIAL_ID",
+          "name": "Shopify account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse checkout data\nconst checkout = $input.first().json;\n\nconst cartValue = parseFloat(checkout.total_price || 0);\nconst itemCount = (checkout.line_items || []).length;\n\nlet customerType = 'new';\nif (checkout.customer?.orders_count > 5) customerType = 'vip';\nelse if (checkout.customer?.orders_count > 0) customerType = 'returning';\n\nreturn [{\n  json: {\n    checkout_id: checkout.token || checkout.id,\n    cart_value: cartValue,\n    item_count: itemCount,\n    customer_type: customerType,\n    customer_id: checkout.customer?.id,\n    shipping_country: checkout.shipping_address?.country_code || 'US',\n    free_shipping_threshold: 75,\n    triggered_at: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "code-parse",
+      "name": "Parse Checkout",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [450, 300]
+    },
+    {
+      "parameters": {
+        "model": "gpt-4o-mini",
+        "options": {},
+        "messages": {
+          "message": [
+            {
+              "role": "system",
+              "content": "You are a gamification designer for e-commerce. Determine gamification element: spin wheel (cart > $75), progress bar (always), mystery discount (first-time), streak reward (returning). Discounts must be profitable. VIP gets better odds. Return ONLY JSON."
+            },
+            {
+              "role": "user",
+              "content": "=Cart value: ${{ $json.cart_value }}\nCustomer: {{ $json.customer_type }}\nItems: {{ $json.item_count }}\nFree shipping threshold: ${{ $json.free_shipping_threshold }}\n\nReturn JSON:\n{\"element\": \"spin_wheel|progress_bar|mystery_box\", \"discount\": \"5%|10%|15%|free_shipping\", \"probability\": number, \"message\": \"string\", \"ui_config\": {}}"
+            }
+          ]
+        }
+      },
+      "id": "openai-gamify",
+      "name": "AI: Gamify Strategy",
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1,
+      "position": [650, 300],
+      "credentials": {
+        "openAiApi": {
+          "id": "YOUR_OPENAI_CREDENTIAL_ID",
+          "name": "OpenAI account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build gamification config\nconst aiResponseText = $input.first().json.content;\nlet strategy;\n\ntry {\n  const cleaned = aiResponseText.replace(/^```json\\s*/i, '').replace(/^```\\s*/i, '').replace(/```\\s*$/i, '').trim();\n  strategy = JSON.parse(cleaned);\n} catch (e) {\n  const cart = $input.all()[0].json;\n  strategy = {\n    element: cart.cart_value > 75 ? 'spin_wheel' : 'progress_bar',\n    discount: cart.customer_type === 'vip' ? '15%' : '10%',\n    probability: cart.customer_type === 'vip' ? 0.8 : 0.5,\n    message: 'Spin to win a discount!',\n    ui_config: {}\n  };\n}\n\nconst checkout = $input.all()[0].json;\n\n// Generate discount code\nconst discountCode = 'SPIN' + Math.random().toString(36).substring(2, 8).toUpperCase();\n\n// Parse discount percentage for Shopify price rule\nconst discountStr = strategy.discount || '10%';\nlet discountPercent = 10;\nif (discountStr !== 'free_shipping') {\n  discountPercent = parseFloat(discountStr.replace('%', '')) || 10;\n}\n\n// Progress bar\nconst progressPercent = Math.min(100, (checkout.cart_value / checkout.free_shipping_threshold) * 100);\nconst remainingForFreeShipping = Math.max(0, checkout.free_shipping_threshold - checkout.cart_value);\n\nreturn [{\n  json: {\n    checkout_id: checkout.checkout_id,\n    gamification_type: strategy.element,\n    discount_code: discountCode,\n    discount_value: strategy.discount,\n    discount_percent: discountPercent,\n    is_free_shipping: discountStr === 'free_shipping',\n    probability: strategy.probability,\n    message: strategy.message,\n    ui_config: {\n      show_progress_bar: true,\n      progress_percent: progressPercent,\n      remaining_for_free_shipping: remainingForFreeShipping,\n      show_spin_wheel: strategy.element === 'spin_wheel',\n      show_mystery_box: strategy.element === 'mystery_box',\n      wheel_segments: [\n        { label: '10% OFF', value: '10%' },\n        { label: '5% OFF', value: '5%' },\n        { label: 'Free Shipping', value: 'free_shipping' },\n        { label: 'Try Again', value: null }\n      ]\n    },\n    engagement_score: checkout.cart_value > 100 ? 10 : checkout.cart_value > 50 ? 7 : 5,\n    created_at: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "code-build",
+      "name": "Build Gamification",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [850, 300]
+    },
+    {
+      "parameters": {
+        "url": "=https://{{ $env.SHOPIFY_SHOP_DOMAIN }}/admin/api/2024-01/price_rules.json",
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Shopify-Access-Token",
+              "value": "={{ $env.SHOPIFY_ACCESS_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"price_rule\": {\n    \"title\": \"{{ $json.discount_code }}\",\n    \"target_type\": \"line_item\",\n    \"target_selection\": \"all\",\n    \"allocation_method\": \"across\",\n    \"value_type\": \"{{ $json.is_free_shipping ? 'shipping' : 'percentage' }}\",\n    \"value\": \"{{ $json.is_free_shipping ? '-100.0' : '-' + $json.discount_percent + '.0' }}\",\n    \"customer_selection\": \"all\",\n    \"starts_at\": \"{{ new Date().toISOString() }}\",\n    \"ends_at\": \"{{ new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString() }}\",\n    \"usage_limit\": 1,\n    \"once_per_customer\": true\n  }\n}",
+        "options": {}
+      },
+      "id": "http-create-price-rule",
+      "name": "Create Shopify Price Rule",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [1050, 200]
+    },
+    {
+      "parameters": {
+        "url": "=https://{{ $env.SHOPIFY_SHOP_DOMAIN }}/admin/api/2024-01/price_rules/{{ $json.price_rule.id }}/discount_codes.json",
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Shopify-Access-Token",
+              "value": "={{ $env.SHOPIFY_ACCESS_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"discount_code\": {\n    \"code\": \"{{ $('Build Gamification').item.json.discount_code }}\"\n  }\n}",
+        "options": {}
+      },
+      "id": "http-create-discount-code",
+      "name": "Create Shopify Discount Code",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [1250, 200]
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "tableId": "checkout_gamification",
+        "fields": [
+          {
+            "fieldId": "checkout_id",
+            "value": "={{ $('Build Gamification').item.json.checkout_id }}"
+          },
+          {
+            "fieldId": "gamification_type",
+            "value": "={{ $('Build Gamification').item.json.gamification_type }}"
+          },
+          {
+            "fieldId": "discount_code",
+            "value": "={{ $('Build Gamification').item.json.discount_code }}"
+          },
+          {
+            "fieldId": "discount_value",
+            "value": "={{ $('Build Gamification').item.json.discount_value }}"
+          },
+          {
+            "fieldId": "engagement_score",
+            "value": "={{ $('Build Gamification').item.json.engagement_score }}"
+          },
+          {
+            "fieldId": "status",
+            "value": "active"
+          },
+          {
+            "fieldId": "created_at",
+            "value": "={{ $('Build Gamification').item.json.created_at }}"
+          }
+        ]
+      },
+      "id": "supabase-store",
+      "name": "Store Config",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [1450, 200],
+      "credentials": {
+        "supabaseApi": {
+          "id": "YOUR_SUPABASE_CREDENTIAL_ID",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "channel": "=#checkout-analytics",
+        "text": "=🎮 GAMIFICATION ACTIVATED\n\nCheckout: {{ $('Build Gamification').item.json.checkout_id }}\nType: {{ $('Build Gamification').item.json.gamification_type }}\nDiscount Code: {{ $('Build Gamification').item.json.discount_code }} ({{ $('Build Gamification').item.json.discount_value }})\nEngagement Score: {{ $('Build Gamification').item.json.engagement_score }}/10\n\nProgress: {{ $('Build Gamification').item.json.ui_config.progress_percent.toFixed(0) }}% to free shipping\n${{ $('Build Gamification').item.json.ui_config.remaining_for_free_shipping }} more needed!\n\n✅ Discount code live in Shopify",
+        "otherOptions": {}
+      },
+      "id": "slack-notify",
+      "name": "Notify Slack",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [1650, 200],
+      "credentials": {
+        "slackApi": {
+          "id": "YOUR_SLACK_CREDENTIAL_ID",
+          "name": "Slack account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "json": "={{ JSON.stringify({ gamification: $('Build Gamification').item.json }) }}",
+        "options": {}
+      },
+      "id": "respond",
+      "name": "Send Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1450, 400]
+    }
+  ],
+  "connections": {
+    "Shopify: Checkout Started": {
+      "main": [
+        [
+          {
+            "node": "Parse Checkout",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Checkout": {
+      "main": [
+        [
+          {
+            "node": "AI: Gamify Strategy",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI: Gamify Strategy": {
+      "main": [
+        [
+          {
+            "node": "Build Gamification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Gamification": {
+      "main": [
+        [
+          {
+            "node": "Create Shopify Price Rule",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Send Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Shopify Price Rule": {
+      "main": [
+        [
+          {
+            "node": "Create Shopify Discount Code",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Shopify Discount Code": {
+      "main": [
+        [
+          {
+            "node": "Store Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Store Config": {
+      "main": [
+        [
+          {
+            "node": "Notify Slack",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true
+  },
+  "tags": ["d2c", "convert", "gamification", "checkout", "fixed"],
+  "pinData": {}
+}

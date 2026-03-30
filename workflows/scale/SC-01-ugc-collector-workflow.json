@@ -1,0 +1,366 @@
+{
+  "name": "SC-01: UGC Collector & Organizer [FIXED]",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "expression": "0 */6 * * *"
+            }
+          ]
+        }
+      },
+      "id": "schedule-trigger",
+      "name": "Schedule: Every 6 Hours",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1,
+      "position": [250, 300]
+    },
+    {
+      "parameters": {
+        "url": "=https://graph.instagram.com/me/tags",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "fields",
+              "value": "id,caption,media_type,media_url,permalink,timestamp,username,owner"
+            },
+            {
+              "name": "access_token",
+              "value": "={{ $env.INSTAGRAM_ACCESS_TOKEN }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "http-instagram",
+      "name": "Fetch Tagged Posts",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [450, 300]
+    },
+    {
+      "parameters": {
+        "operation": "select",
+        "tableId": "ugc_library",
+        "filters": {
+          "conditions": [
+            {
+              "column": "created_at",
+              "condition": "gte",
+              "value": "={{ DateTime.now().minus({ days: 7 }).toISO() }}"
+            }
+          ]
+        }
+      },
+      "id": "supabase-existing",
+      "name": "Get Existing UGC",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [450, 500],
+      "credentials": {
+        "supabaseApi": {
+          "id": "YOUR_SUPABASE_CREDENTIAL_ID",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Filter new UGC\n// FIX BUG-05: Instagram Messaging API requires IGSID (owner.id), NOT username\n// Sending to creator_handle (username) as recipient will 400 error\nconst igData = $input.all()[0]?.json?.data || [];\nconst existing = $input.all()[1]?.json || [];\nconst existingIds = existing.map(e => e.post_id);\n\nconst newPosts = igData.filter(post => {\n  return !existingIds.includes(post.id);\n}).map(post => ({\n  post_id: post.id,\n  platform: 'instagram',\n  creator_handle: post.username,\n  // owner.id IS the IGSID — required for Instagram Messaging API\n  // This is only available if the creator has interacted with the account first\n  creator_igsid: post.owner?.id || null,\n  caption: post.caption || '',\n  media_url: post.media_url,\n  permalink: post.permalink,\n  media_type: post.media_type,\n  posted_at: post.timestamp,\n  mentioned_products: extractProducts(post.caption)\n}));\n\nfunction extractProducts(caption) {\n  if (!caption) return [];\n  const products = [];\n  if (caption.toLowerCase().includes('product')) products.push('general');\n  return products;\n}\n\nreturn newPosts.length > 0 ? newPosts.map(p => ({ json: p })) : [];"
+      },
+      "id": "code-filter",
+      "name": "Filter New UGC",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [650, 400]
+    },
+    {
+      "parameters": {
+        "model": "gpt-4o-mini",
+        "options": {},
+        "messages": {
+          "message": [
+            {
+              "role": "system",
+              "content": "You are a UGC curator. Analyze quality: image/video quality score, brand alignment, engagement quality. Write friendly permission request message. Return ONLY JSON."
+            },
+            {
+              "role": "user",
+              "content": "=Creator: @{{ $json.creator_handle }}\nCaption: {{ $json.caption }}\nMedia type: {{ $json.media_type }}\n\nReturn JSON:\n{\"quality_score\": number (1-10), \"brand_aligned\": boolean, \"permission_message\": \"string\", \"suggested_use\": \"social|ads|website\", \"priority\": \"high|medium|low\"}"
+            }
+          ]
+        }
+      },
+      "id": "openai-analyze",
+      "name": "AI: Analyze UGC",
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1,
+      "position": [850, 400],
+      "credentials": {
+        "openAiApi": {
+          "id": "YOUR_OPENAI_CREDENTIAL_ID",
+          "name": "OpenAI account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Process analysis\nconst aiResponseText = $input.first().json.content;\nconst post = $input.all()[0].json;\n\nlet analysis;\ntry {\n  const cleaned = aiResponseText.replace(/^```json\\s*/i, '').replace(/^```\\s*/i, '').replace(/```\\s*$/i, '').trim();\n  analysis = JSON.parse(cleaned);\n} catch (e) {\n  analysis = {\n    quality_score: 5,\n    brand_aligned: true,\n    permission_message: 'Hi! We love your post. Can we share it?',\n    suggested_use: 'social',\n    priority: 'medium'\n  };\n}\n\n// Skip low quality\nif (analysis.quality_score < 5) {\n  return [];\n}\n\nreturn [{\n  json: {\n    ugc_id: 'UGC-' + Date.now(),\n    post_id: post.post_id,\n    platform: post.platform,\n    creator_handle: post.creator_handle,\n    creator_igsid: post.creator_igsid,\n    media_url: post.media_url,\n    permalink: post.permalink,\n    caption: post.caption,\n    quality_score: analysis.quality_score,\n    brand_aligned: analysis.brand_aligned,\n    permission_message: analysis.permission_message,\n    suggested_use: analysis.suggested_use,\n    priority: analysis.priority,\n    permission_status: 'requested',\n    tags: post.mentioned_products,\n    timestamp: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "code-process",
+      "name": "Process Analysis",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1050, 400]
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "tableId": "ugc_library",
+        "fields": [
+          {
+            "fieldId": "ugc_id",
+            "value": "={{ $json.ugc_id }}"
+          },
+          {
+            "fieldId": "post_id",
+            "value": "={{ $json.post_id }}"
+          },
+          {
+            "fieldId": "platform",
+            "value": "={{ $json.platform }}"
+          },
+          {
+            "fieldId": "creator_handle",
+            "value": "={{ $json.creator_handle }}"
+          },
+          {
+            "fieldId": "media_url",
+            "value": "={{ $json.media_url }}"
+          },
+          {
+            "fieldId": "quality_score",
+            "value": "={{ $json.quality_score }}"
+          },
+          {
+            "fieldId": "permission_status",
+            "value": "={{ $json.permission_status }}"
+          },
+          {
+            "fieldId": "created_at",
+            "value": "={{ $json.timestamp }}"
+          }
+        ]
+      },
+      "id": "supabase-store",
+      "name": "Store UGC",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [1250, 300],
+      "credentials": {
+        "supabaseApi": {
+          "id": "YOUR_SUPABASE_CREDENTIAL_ID",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": false,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "condition-igsid",
+              "leftValue": "={{ $json.creator_igsid }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "isNotEmpty"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "if-has-igsid",
+      "name": "Has IGSID?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1250, 500]
+    },
+    {
+      "parameters": {
+        "url": "=https://graph.instagram.com/v19.0/me/messages",
+        "method": "POST",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "access_token",
+              "value": "={{ $env.INSTAGRAM_ACCESS_TOKEN }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"recipient\": { \"id\": \"{{ $json.creator_igsid }}\" },\n  \"message\": { \"text\": \"{{ $json.permission_message }}\" }\n}",
+        "options": {}
+      },
+      "id": "http-dm",
+      "name": "Send Permission DM",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [1450, 450]
+    },
+    {
+      "parameters": {
+        "channel": "=#ugc-team",
+        "text": "=📸 NEW UGC COLLECTED\n\nCreator: @{{ $json.creator_handle }}\nQuality Score: {{ $json.quality_score }}/10\nBrand Aligned: {{ $json.brand_aligned ? 'Yes' : 'No' }}\nSuggested Use: {{ $json.suggested_use }}\nPriority: {{ $json.priority }}\n\nPermission DM: {{ $json.creator_igsid ? 'Sent ✅' : 'Skipped — no IGSID (creator must message us first)' }}",
+        "otherOptions": {}
+      },
+      "id": "slack-notify",
+      "name": "Notify Slack",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [1650, 400],
+      "credentials": {
+        "slackApi": {
+          "id": "YOUR_SLACK_CREDENTIAL_ID",
+          "name": "Slack account"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Schedule: Every 6 Hours": {
+      "main": [
+        [
+          {
+            "node": "Fetch Tagged Posts",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Get Existing UGC",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Tagged Posts": {
+      "main": [
+        [
+          {
+            "node": "Filter New UGC",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Existing UGC": {
+      "main": [
+        [
+          {
+            "node": "Filter New UGC",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Filter New UGC": {
+      "main": [
+        [
+          {
+            "node": "AI: Analyze UGC",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI: Analyze UGC": {
+      "main": [
+        [
+          {
+            "node": "Process Analysis",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Process Analysis": {
+      "main": [
+        [
+          {
+            "node": "Store UGC",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Has IGSID?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has IGSID?": {
+      "main": [
+        [
+          {
+            "node": "Send Permission DM",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Notify Slack",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Store UGC": {
+      "main": [
+        [
+          {
+            "node": "Notify Slack",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Permission DM": {
+      "main": [
+        [
+          {
+            "node": "Notify Slack",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true
+  },
+  "tags": ["d2c", "scale", "ugc", "instagram", "scheduled", "fixed"],
+  "pinData": {}
+}

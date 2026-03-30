@@ -1,0 +1,384 @@
+{
+  "name": "I-03: Customer Intelligence Agent",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "i03-customer-intel",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-trigger",
+      "name": "Webhook: Interaction",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [250, 300],
+      "webhookId": "i03-customer-intel"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse interaction\nconst input = $input.first().json.body || $input.first().json;\n\nreturn [{\n  json: {\n    customer_id: input.customer_id,\n    interaction_type: input.interaction_type || 'general',\n    channel: input.channel || 'web',\n    intent: input.intent || 'unknown',\n    sentiment: input.sentiment || 'neutral',\n    message: input.message || '',\n    product_interest: input.product_interest || [],\n    timestamp: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "code-parse",
+      "name": "Parse Interaction",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [450, 300]
+    },
+    {
+      "parameters": {
+        "operation": "select",
+        "tableId": "customers",
+        "filters": {
+          "conditions": [
+            {
+              "column": "id",
+              "condition": "eq",
+              "value": "={{ $json.customer_id }}"
+            }
+          ]
+        }
+      },
+      "id": "supabase-customer",
+      "name": "Get Customer",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [650, 300],
+      "credentials": {
+        "supabaseApi": {
+          "id": "YOUR_SUPABASE_CREDENTIAL_ID",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "select",
+        "tableId": "customer_interactions",
+        "filters": {
+          "conditions": [
+            {
+              "column": "customer_id",
+              "condition": "eq",
+              "value": "={{ $json.customer_id }}"
+            }
+          ],
+          "limit": 10
+        }
+      },
+      "id": "supabase-history",
+      "name": "Get Interaction History",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [650, 500],
+      "credentials": {
+        "supabaseApi": {
+          "id": "YOUR_SUPABASE_CREDENTIAL_ID",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "model": "gpt-4o-mini",
+        "options": {},
+        "messages": {
+          "message": [
+            {
+              "role": "system",
+              "content": "You are a customer intelligence analyst. Analyze customer profile: segment classification, product affinities, churn risk, upsell opportunities, personalized recommendations. Use data-driven insights. Return JSON with confidence score."
+            },
+            {
+              "role": "user",
+              "content": "=Customer: {{ $json.customer_id }}\nRecent interactions: {{ $json.interaction_count || 0 }}\nPurchase history: {{ $json.order_count || 0 }} orders\nLTV: ${{ $json.lifetime_value || 0 }}\nCurrent sentiment: {{ $json.sentiment }}\nProduct interests: {{ $json.product_interest.join(', ') }}\n\nReturn JSON:\n{\"segment\": \"string\", \"product_affinities\": [\"string\"], \"churn_risk\": \"low|medium|high\", \"upsell_opportunities\": [\"string\"], \"recommendations\": [\"string\"], \"confidence\": number (0-1)}"
+            }
+          ]
+        }
+      },
+      "id": "openai-analyze",
+      "name": "AI: Analyze Profile",
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1,
+      "position": [850, 400],
+      "credentials": {
+        "openAiApi": {
+          "id": "YOUR_OPENAI_CREDENTIAL_ID",
+          "name": "OpenAI account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Process analysis\nconst aiResponse = $input.first().json.content;\nconst interaction = $input.all()[0].json;\nconst customer = $input.all()[1]?.json?.[0] || {};\nconst history = $input.all()[2]?.json || [];\n\nlet analysis;\ntry {\n  analysis = JSON.parse(aiResponse);\n} catch (e) {\n  analysis = {\n    segment: 'Regular',\n    product_affinities: [],\n    churn_risk: 'low',\n    upsell_opportunities: [],\n    recommendations: ['Continue nurturing'],\n    confidence: 0.5\n  };\n}\n\n// Calculate LTV prediction\nconst avgOrderValue = customer.lifetime_value / (customer.order_count || 1);\nconst predictedLTV = avgOrderValue * (customer.order_count || 1) * 1.5;\n\nreturn [{\n  json: {\n    intelligence_id: 'CI-' + Date.now(),\n    customer_id: interaction.customer_id,\n    segment: analysis.segment,\n    intent_history: history.map(h => h.intent),\n    sentiment_trend: calculateSentimentTrend(history),\n    product_affinity: analysis.product_affinities,\n    churn_risk_score: analysis.churn_risk === 'high' ? 80 : analysis.churn_risk === 'medium' ? 50 : 20,\n    ltv_prediction: predictedLTV.toFixed(2),\n    upsell_opportunities: analysis.upsell_opportunities,\n    recommendations: analysis.recommendations,\n    confidence: analysis.confidence,\n    last_updated: interaction.timestamp\n  }\n}];\n\nfunction calculateSentimentTrend(history) {\n  if (history.length === 0) return 'neutral';\n  const recent = history.slice(-5);\n  const positive = recent.filter(h => h.sentiment === 'positive').length;\n  const negative = recent.filter(h => h.sentiment === 'negative').length;\n  if (positive > negative) return 'improving';\n  if (negative > positive) return 'declining';\n  return 'stable';\n}"
+      },
+      "id": "code-process",
+      "name": "Process Intelligence",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1050, 400]
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "tableId": "customer_interactions",
+        "fields": [
+          {
+            "fieldId": "customer_id",
+            "value": "={{ $json.customer_id }}"
+          },
+          {
+            "fieldId": "intent",
+            "value": "={{ $json.intent }}"
+          },
+          {
+            "fieldId": "sentiment",
+            "value": "={{ $json.sentiment }}"
+          },
+          {
+            "fieldId": "created_at",
+            "value": "={{ $json.timestamp }}"
+          }
+        ]
+      },
+      "id": "supabase-log",
+      "name": "Log Interaction",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [1250, 200],
+      "credentials": {
+        "supabaseApi": {
+          "id": "YOUR_SUPABASE_CREDENTIAL_ID",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "upsert",
+        "tableId": "customer_intelligence",
+        "filters": {
+          "conditions": [
+            {
+              "column": "customer_id",
+              "condition": "eq",
+              "value": "={{ $json.customer_id }}"
+            }
+          ]
+        },
+        "fields": [
+          {
+            "fieldId": "customer_id",
+            "value": "={{ $json.customer_id }}"
+          },
+          {
+            "fieldId": "segment",
+            "value": "={{ $json.segment }}"
+          },
+          {
+            "fieldId": "churn_risk_score",
+            "value": "={{ $json.churn_risk_score }}"
+          },
+          {
+            "fieldId": "ltv_prediction",
+            "value": "={{ $json.ltv_prediction }}"
+          },
+          {
+            "fieldId": "product_affinity",
+            "value": "={{ JSON.stringify($json.product_affinity) }}"
+          },
+          {
+            "fieldId": "updated_at",
+            "value": "={{ $json.last_updated }}"
+          }
+        ]
+      },
+      "id": "supabase-intel",
+      "name": "Update Intelligence",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [1250, 400],
+      "credentials": {
+        "supabaseApi": {
+          "id": "YOUR_SUPABASE_CREDENTIAL_ID",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "condition-1",
+              "leftValue": "={{ $json.churn_risk_score }}",
+              "rightValue": "70",
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "if-risk",
+      "name": "High Risk?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1450, 400]
+    },
+    {
+      "parameters": {
+        "channel": "=#customer-intel",
+        "text": "=🧠 CUSTOMER INTELLIGENCE\n\nCustomer: {{ $json.customer_id }}\nSegment: {{ $json.segment }}\nChurn Risk: {{ $json.churn_risk_score }}/100 {{ $json.churn_risk_score > 70 ? '🔴' : $json.churn_risk_score > 40 ? '🟡' : '🟢' }}\nLTV Prediction: ${{ $json.ltv_prediction }}\nSentiment Trend: {{ $json.sentiment_trend }}\n\nUpsell Opportunities:\n{{ $json.upsell_opportunities.map(o => '• ' + o).join('\\n') }}\n\nConfidence: {{ ($json.confidence * 100).toFixed(0) }}%",
+        "otherOptions": {}
+      },
+      "id": "slack-notify",
+      "name": "Notify Slack",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [1650, 350],
+      "credentials": {
+        "slackApi": {
+          "id": "YOUR_SLACK_CREDENTIAL_ID",
+          "name": "Slack account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "json": "={\"status\": \"logged\", \"churn_risk\": {{ $json.churn_risk_score }}, \"segment\": \"{{ $json.segment }}\"}",
+        "options": {}
+      },
+      "id": "webhook-response",
+      "name": "Return Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1850, 400]
+    }
+  ],
+  "connections": {
+    "Webhook: Interaction": {
+      "main": [
+        [
+          {
+            "node": "Parse Interaction",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Interaction": {
+      "main": [
+        [
+          {
+            "node": "Get Customer",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Get Interaction History",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Customer": {
+      "main": [
+        [
+          {
+            "node": "AI: Analyze Profile",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Interaction History": {
+      "main": [
+        [
+          {
+            "node": "AI: Analyze Profile",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI: Analyze Profile": {
+      "main": [
+        [
+          {
+            "node": "Process Intelligence",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Process Intelligence": {
+      "main": [
+        [
+          {
+            "node": "Log Interaction",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Update Intelligence",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "High Risk?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "High Risk?": {
+      "main": [
+        [
+          {
+            "node": "Notify Slack",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Return Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify Slack": {
+      "main": [
+        [
+          {
+            "node": "Return Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true
+  },
+  "tags": ["d2c", "intelligence", "customer", "analytics"],
+  "pinData": {}
+}

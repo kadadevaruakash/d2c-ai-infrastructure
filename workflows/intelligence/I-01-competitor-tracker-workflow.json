@@ -1,0 +1,328 @@
+{
+  "name": "I-01: Competitor Tracker Agent",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "expression": "0 7 * * *"
+            }
+          ]
+        }
+      },
+      "id": "schedule-trigger",
+      "name": "Schedule: Daily 7 AM",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1,
+      "position": [250, 300]
+    },
+    {
+      "parameters": {
+        "operation": "select",
+        "tableId": "competitors",
+        "filters": {
+          "conditions": [
+            {
+              "column": "status",
+              "condition": "eq",
+              "value": "active"
+            }
+          ]
+        }
+      },
+      "id": "supabase-competitors",
+      "name": "Get Competitors",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [450, 300],
+      "credentials": {
+        "supabaseApi": {
+          "id": "YOUR_SUPABASE_CREDENTIAL_ID",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {},
+      "id": "split-batch",
+      "name": "Split in Batches",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [650, 300]
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.website_url }}",
+        "options": {}
+      },
+      "id": "http-scrape",
+      "name": "Scrape Website",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [850, 300],
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "model": "gpt-4o-mini",
+        "options": {},
+        "messages": {
+          "message": [
+            {
+              "role": "system",
+              "content": "You are a competitive intelligence analyst. Analyze competitive changes: strategic implication, threat level (low/medium/high), recommended response, timeline for action. Focus on actionable insights."
+            },
+            {
+              "role": "user",
+              "content": "=Competitor: {{ $json.name }}\nWebsite content: {{ $json.data.substring(0, 1000) }}...\n\nWhat changes do you detect? Return JSON:\n{\"changes_detected\": [\"string\"], \"implication\": \"string\", \"threat_level\": \"low|medium|high\", \"recommended_action\": \"string\", \"timeline\": \"string\"}"
+            }
+          ]
+        }
+      },
+      "id": "openai-analyze",
+      "name": "AI: Analyze Changes",
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1,
+      "position": [1050, 300],
+      "credentials": {
+        "openAiApi": {
+          "id": "YOUR_OPENAI_CREDENTIAL_ID",
+          "name": "OpenAI account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Process analysis\nconst aiResponse = $input.first().json.content;\nconst competitor = $input.all()[0].json;\n\nlet analysis;\ntry {\n  analysis = JSON.parse(aiResponse);\n} catch (e) {\n  analysis = {\n    changes_detected: [],\n    implication: 'No significant changes',\n    threat_level: 'low',\n    recommended_action: 'Continue monitoring',\n    timeline: 'weekly'\n  };\n}\n\n// Skip if no significant changes\nif (analysis.changes_detected.length === 0 && analysis.threat_level === 'low') {\n  return [];\n}\n\nreturn [{\n  json: {\n    alert_id: 'COMP-' + Date.now(),\n    competitor_id: competitor.id,\n    competitor_name: competitor.name,\n    changes: analysis.changes_detected,\n    implication: analysis.implication,\n    threat_level: analysis.threat_level,\n    recommended_action: analysis.recommended_action,\n    timeline: analysis.timeline,\n    timestamp: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "code-process",
+      "name": "Process Analysis",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1250, 300]
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "tableId": "competitor_alerts",
+        "fields": [
+          {
+            "fieldId": "alert_id",
+            "value": "={{ $json.alert_id }}"
+          },
+          {
+            "fieldId": "competitor_id",
+            "value": "={{ $json.competitor_id }}"
+          },
+          {
+            "fieldId": "changes",
+            "value": "={{ JSON.stringify($json.changes) }}"
+          },
+          {
+            "fieldId": "threat_level",
+            "value": "={{ $json.threat_level }}"
+          },
+          {
+            "fieldId": "recommended_action",
+            "value": "={{ $json.recommended_action }}"
+          },
+          {
+            "fieldId": "created_at",
+            "value": "={{ $json.timestamp }}"
+          }
+        ]
+      },
+      "id": "supabase-store",
+      "name": "Store Alert",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [1450, 200],
+      "credentials": {
+        "supabaseApi": {
+          "id": "YOUR_SUPABASE_CREDENTIAL_ID",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "condition-1",
+              "leftValue": "={{ $json.threat_level }}",
+              "rightValue": "high",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "if-high",
+      "name": "High Threat?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1450, 400]
+    },
+    {
+      "parameters": {
+        "channel": "=#competitor-intel",
+        "text": "=🕵️ COMPETITOR ALERT: {{ $json.competitor_name }}\n\nThreat Level: {{ $json.threat_level === 'high' ? '🔴 HIGH' : $json.threat_level === 'medium' ? '🟡 MEDIUM' : '🟢 LOW' }}\n\nChanges Detected:\n{{ $json.changes.map(c => '• ' + c).join('\\n') }}\n\nImplication:\n{{ $json.implication }}\n\n💡 Recommended Action:\n{{ $json.recommended_action }}\n\n⏰ Timeline: {{ $json.timeline }}",
+        "otherOptions": {}
+      },
+      "id": "slack-notify",
+      "name": "Notify Slack",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [1650, 350],
+      "credentials": {
+        "slackApi": {
+          "id": "YOUR_SLACK_CREDENTIAL_ID",
+          "name": "Slack account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "to": "=strategy@yourcompany.com",
+        "subject": "=🚨 HIGH THREAT: {{ $json.competitor_name }}",
+        "text": "=HIGH THREAT COMPETITOR ALERT\\n\\nCompetitor: {{ $json.competitor_name }}\\n\\nChanges: {{ $json.changes.join(', ') }}\\n\\nImplication: {{ $json.implication }}\\n\\nAction Required: {{ $json.recommended_action }}",
+        "options": {}
+      },
+      "id": "email-alert",
+      "name": "Email Strategy Team",
+      "type": "n8n-nodes-base.sendEmail",
+      "typeVersion": 2,
+      "position": [1650, 450]
+    }
+  ],
+  "connections": {
+    "Schedule: Daily 7 AM": {
+      "main": [
+        [
+          {
+            "node": "Get Competitors",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Competitors": {
+      "main": [
+        [
+          {
+            "node": "Split in Batches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split in Batches": {
+      "main": [
+        [
+          {
+            "node": "Scrape Website",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Scrape Website": {
+      "main": [
+        [
+          {
+            "node": "AI: Analyze Changes",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI: Analyze Changes": {
+      "main": [
+        [
+          {
+            "node": "Process Analysis",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Process Analysis": {
+      "main": [
+        [
+          {
+            "node": "Store Alert",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "High Threat?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "High Threat?": {
+      "main": [
+        [
+          {
+            "node": "Email Strategy Team",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Notify Slack",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Store Alert": {
+      "main": [
+        [
+          {
+            "node": "Split in Batches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Email Strategy Team": {
+      "main": [
+        [
+          {
+            "node": "Notify Slack",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true
+  },
+  "tags": ["d2c", "intelligence", "competitor", "scheduled"],
+  "pinData": {}
+}

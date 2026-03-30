@@ -1,0 +1,437 @@
+{
+  "name": "R-02: Loyalty & Rewards Program Engine [FIXED]",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "r02-loyalty",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-trigger",
+      "name": "Webhook: Loyalty Event",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [250, 300],
+      "webhookId": "r02-loyalty"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse loyalty event\nconst input = $input.first().json.body || $input.first().json;\n\nconst pointsRules = {\n  purchase: (value) => Math.floor(value),\n  referral: () => 50,\n  review: () => 25,\n  social_share: () => 10,\n  birthday: () => 100\n};\n\nconst eventType = input.event_type || 'purchase';\nconst pointsEarned = pointsRules[eventType] ? pointsRules[eventType](input.value || 0) : 0;\n\nreturn [{\n  json: {\n    customer_id: input.customer_id,\n    event_type: eventType,\n    value: input.value || 0,\n    points_earned: pointsEarned,\n    reference_id: input.reference_id || null,\n    timestamp: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "code-parse",
+      "name": "Parse Event",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [450, 300]
+    },
+    {
+      "parameters": {
+        "operation": "select",
+        "tableId": "loyalty_accounts",
+        "filters": {
+          "conditions": [
+            {
+              "column": "customer_id",
+              "condition": "eq",
+              "value": "={{ $json.customer_id }}"
+            }
+          ]
+        }
+      },
+      "id": "supabase-account",
+      "name": "Get Loyalty Account",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [650, 300],
+      "credentials": {
+        "supabaseApi": {
+          "id": "YOUR_SUPABASE_CREDENTIAL_ID",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Calculate loyalty update\nconst event = $input.all()[0].json;\nconst account = $input.all()[1]?.json?.[0];\n\nconst currentPoints = account?.points_balance || 0;\nconst lifetimePoints = (account?.lifetime_points || 0) + event.points_earned;\nconst newBalance = currentPoints + event.points_earned;\n\nconst tiers = [\n  { name: 'bronze', min: 0, max: 499, discount: 0 },\n  { name: 'silver', min: 500, max: 1499, discount: 5 },\n  { name: 'gold', min: 1500, max: 4999, discount: 10 },\n  { name: 'platinum', min: 5000, max: Infinity, discount: 15 }\n];\n\nconst currentTier = account?.tier || 'bronze';\nconst newTier = tiers.find(t => lifetimePoints >= t.min && lifetimePoints <= t.max)?.name || 'bronze';\nconst tierUpgraded = newTier !== currentTier && tiers.findIndex(t => t.name === newTier) > tiers.findIndex(t => t.name === currentTier);\n\nreturn [{\n  json: {\n    customer_id: event.customer_id,\n    event_type: event.event_type,\n    points_earned: event.points_earned,\n    previous_balance: currentPoints,\n    new_balance: newBalance,\n    lifetime_points: lifetimePoints,\n    previous_tier: currentTier,\n    new_tier: newTier,\n    tier_upgraded: tierUpgraded,\n    tier_discount: tiers.find(t => t.name === newTier)?.discount || 0,\n    timestamp: event.timestamp\n  }\n}];"
+      },
+      "id": "code-calculate",
+      "name": "Calculate Points",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [850, 300]
+    },
+    {
+      "parameters": {
+        "operation": "upsert",
+        "tableId": "loyalty_accounts",
+        "filters": {
+          "conditions": [
+            {
+              "column": "customer_id",
+              "condition": "eq",
+              "value": "={{ $json.customer_id }}"
+            }
+          ]
+        },
+        "fields": [
+          {
+            "fieldId": "customer_id",
+            "value": "={{ $json.customer_id }}"
+          },
+          {
+            "fieldId": "points_balance",
+            "value": "={{ $json.new_balance }}"
+          },
+          {
+            "fieldId": "lifetime_points",
+            "value": "={{ $json.lifetime_points }}"
+          },
+          {
+            "fieldId": "tier",
+            "value": "={{ $json.new_tier }}"
+          },
+          {
+            "fieldId": "updated_at",
+            "value": "={{ $json.timestamp }}"
+          }
+        ]
+      },
+      "id": "supabase-update",
+      "name": "Update Account",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [1050, 200],
+      "credentials": {
+        "supabaseApi": {
+          "id": "YOUR_SUPABASE_CREDENTIAL_ID",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "tableId": "loyalty_transactions",
+        "fields": [
+          {
+            "fieldId": "customer_id",
+            "value": "={{ $json.customer_id }}"
+          },
+          {
+            "fieldId": "event_type",
+            "value": "={{ $json.event_type }}"
+          },
+          {
+            "fieldId": "points",
+            "value": "={{ $json.points_earned }}"
+          },
+          {
+            "fieldId": "balance_after",
+            "value": "={{ $json.new_balance }}"
+          },
+          {
+            "fieldId": "created_at",
+            "value": "={{ $json.timestamp }}"
+          }
+        ]
+      },
+      "id": "supabase-transaction",
+      "name": "Log Transaction",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [1050, 400],
+      "credentials": {
+        "supabaseApi": {
+          "id": "YOUR_SUPABASE_CREDENTIAL_ID",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "condition-1",
+              "leftValue": "={{ $json.tier_upgraded }}",
+              "rightValue": "true",
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "if-upgrade",
+      "name": "Tier Upgraded?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1250, 300]
+    },
+    {
+      "parameters": {
+        "operation": "select",
+        "tableId": "customers",
+        "filters": {
+          "conditions": [
+            {
+              "column": "id",
+              "condition": "eq",
+              "value": "={{ $json.customer_id }}"
+            }
+          ]
+        },
+        "limit": 1
+      },
+      "id": "supabase-customer",
+      "name": "Fetch Customer Contact",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [1450, 250],
+      "credentials": {
+        "supabaseApi": {
+          "id": "YOUR_SUPABASE_CREDENTIAL_ID",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Merge loyalty upgrade data with customer contact info\n// FIX BUG-06: $json.customer_phone and $json.customer_email were never fetched\n// Both WhatsApp and email nodes would fail silently with undefined recipients\nconst loyaltyData = $('Tier Upgraded?').item.json;\nconst customer = $input.first().json?.[0];\n\nif (!customer) {\n  throw new Error(`Customer ${loyaltyData.customer_id} not found in customers table`);\n}\n\nreturn [{\n  json: {\n    ...loyaltyData,\n    customer_phone: customer.phone || null,\n    customer_email: customer.email || null,\n    customer_name: customer.first_name || 'there'\n  }\n}];"
+      },
+      "id": "code-merge-contact",
+      "name": "Merge Contact Info",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1650, 250]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": false,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "condition-phone",
+              "leftValue": "={{ $json.customer_phone }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "isNotEmpty"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "if-has-phone",
+      "name": "Has Phone?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1850, 200]
+    },
+    {
+      "parameters": {
+        "phoneNumber": "={{ $json.customer_phone }}",
+        "text": "=🎉 CONGRATULATIONS {{ $json.customer_name }}!\n\nYou've been upgraded to {{ $json.new_tier.toUpperCase() }} tier!\n\n✨ New Benefits:\n• {{ $json.tier_discount }}% discount on all orders\n• Early access to sales\n• Exclusive products\n\nYour points: {{ $json.new_balance }}",
+        "additionalFields": {}
+      },
+      "id": "whatsapp-notify",
+      "name": "Send WhatsApp",
+      "type": "n8n-nodes-base.whatsApp",
+      "typeVersion": 1,
+      "position": [2050, 150],
+      "credentials": {
+        "whatsAppApi": {
+          "id": "YOUR_WHATSAPP_CREDENTIAL_ID",
+          "name": "WhatsApp account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "sendOptions": "=options",
+        "fromEmail": "={{ $env.BREVO_FROM_EMAIL }}",
+        "toEmail": "={{ $json.customer_email }}",
+        "subject": "=🎉 You've been upgraded to {{ $json.new_tier.toUpperCase() }}!",
+        "html": "=<h2>Congratulations {{ $json.customer_name }}!</h2><p>You've been upgraded to <strong>{{ $json.new_tier.toUpperCase() }}</strong> tier!</p><p>Your new benefits include {{ $json.tier_discount }}% discount on all orders.</p><p>Points balance: {{ $json.new_balance }}</p>",
+        "options": {}
+      },
+      "id": "brevo-email",
+      "name": "Send Email",
+      "type": "n8n-nodes-base.sendInBlue",
+      "typeVersion": 1,
+      "position": [2050, 300],
+      "credentials": {
+        "sendInBlueApi": {
+          "id": "YOUR_BREVO_CREDENTIAL_ID",
+          "name": "Brevo account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "json": "={\"status\": \"success\", \"points_earned\": {{ $('Calculate Points').item.json.points_earned }}, \"new_balance\": {{ $('Calculate Points').item.json.new_balance }}, \"tier\": \"{{ $('Calculate Points').item.json.new_tier }}\", \"tier_upgraded\": {{ $('Calculate Points').item.json.tier_upgraded }}}",
+        "options": {}
+      },
+      "id": "webhook-response",
+      "name": "Return Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1250, 500]
+    }
+  ],
+  "connections": {
+    "Webhook: Loyalty Event": {
+      "main": [
+        [
+          {
+            "node": "Parse Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Event": {
+      "main": [
+        [
+          {
+            "node": "Get Loyalty Account",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Loyalty Account": {
+      "main": [
+        [
+          {
+            "node": "Calculate Points",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Calculate Points": {
+      "main": [
+        [
+          {
+            "node": "Update Account",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Log Transaction",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Tier Upgraded?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Tier Upgraded?": {
+      "main": [
+        [
+          {
+            "node": "Fetch Customer Contact",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Return Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Customer Contact": {
+      "main": [
+        [
+          {
+            "node": "Merge Contact Info",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge Contact Info": {
+      "main": [
+        [
+          {
+            "node": "Has Phone?",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Send Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has Phone?": {
+      "main": [
+        [
+          {
+            "node": "Send WhatsApp",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "Send WhatsApp": {
+      "main": [
+        [
+          {
+            "node": "Return Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Email": {
+      "main": [
+        [
+          {
+            "node": "Return Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true
+  },
+  "tags": ["d2c", "retain", "loyalty", "rewards", "fixed"],
+  "pinData": {}
+}

@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(node --check /c/Users/kadad/d2c-ai-infrastructure/frontend/app.js)"
+    ]
+  }
+}

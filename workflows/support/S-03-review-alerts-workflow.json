@@ -1,0 +1,334 @@
+{
+  "name": "S-03: Real-Time Review Alerts Agent [FIXED]",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "expression": "*/15"
+            }
+          ]
+        }
+      },
+      "id": "schedule-trigger",
+      "name": "Schedule: Every 15 Min",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1,
+      "position": [250, 300]
+    },
+    {
+      "parameters": {
+        "url": "=https://mybusiness.googleapis.com/v4/accounts/{{ $env.GMB_ACCOUNT_ID }}/locations/{{ $env.GMB_LOCATION_ID }}/reviews",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "pageSize",
+              "value": "10"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "http-gmb",
+      "name": "Fetch Google Reviews",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [450, 200]
+    },
+    {
+      "parameters": {
+        "operation": "select",
+        "tableId": "review_alerts",
+        "filters": {
+          "conditions": [
+            {
+              "column": "created_at",
+              "condition": "gte",
+              "value": "={{ DateTime.now().minus({ hours: 1 }).toISO() }}"
+            }
+          ]
+        }
+      },
+      "id": "supabase-recent",
+      "name": "Get Recent Alerts",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [450, 400],
+      "credentials": {
+        "supabaseApi": {
+          "id": "YOUR_SUPABASE_CREDENTIAL_ID",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Filter new reviews and parse star ratings\n// FIX BUG-04: GMB returns 'FIVE', 'FOUR', etc. — NOT 'STAR_5'\n// parseInt(review.starRating.replace('STAR_', '')) always returns NaN\nconst STAR_MAP = { FIVE: 5, FOUR: 4, THREE: 3, TWO: 2, ONE: 1 };\n\nconst gmbData = $input.all()[0]?.json?.reviews || [];\nconst recentAlerts = $input.all()[1]?.json || [];\nconst alertedIds = recentAlerts.map(a => a.review_id);\n\nconst newReviews = gmbData.filter(review => {\n  const reviewId = review.reviewId || review.name;\n  return !alertedIds.includes(reviewId);\n}).map(review => ({\n  review_id: review.reviewId || review.name,\n  platform: 'google',\n  rating: review.starRating ? (STAR_MAP[review.starRating] || 5) : 5,\n  review_text: review.comment || '',\n  reviewer_name: review.reviewer?.displayName || 'Anonymous',\n  review_time: review.createTime || new Date().toISOString(),\n  reply_url: review.name\n}));\n\nreturn newReviews.length > 0 ? newReviews.map(r => ({ json: r })) : [];"
+      },
+      "id": "code-filter",
+      "name": "Filter New Reviews",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [650, 300]
+    },
+    {
+      "parameters": {
+        "model": "gpt-4o-mini",
+        "options": {},
+        "messages": {
+          "message": [
+            {
+              "role": "system",
+              "content": "You are a reputation management specialist. Analyze sentiment, draft appropriate response. Empathetic for negative reviews. Thank positive reviewers. Never defensive. Include contact info for resolution. Return JSON."
+            },
+            {
+              "role": "user",
+              "content": "=Platform: {{ $json.platform }}\nRating: {{ $json.rating }}/5\nReview: '{{ $json.review_text }}'\nReviewer: {{ $json.reviewer_name }}\n\nReturn JSON:\n{\"sentiment\": \"positive|neutral|negative\", \"urgency\": \"low|medium|high|critical\", \"response_draft\": \"string\", \"action_required\": \"string\"}"
+            }
+          ]
+        }
+      },
+      "id": "openai-analyze",
+      "name": "AI: Analyze Review",
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1,
+      "position": [850, 300],
+      "credentials": {
+        "openAiApi": {
+          "id": "YOUR_OPENAI_CREDENTIAL_ID",
+          "name": "OpenAI account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse AI analysis\nconst aiResponseText = $input.first().json.content;\nlet analysis;\n\ntry {\n  const cleaned = aiResponseText.replace(/^```json\\s*/i, '').replace(/^```\\s*/i, '').replace(/```\\s*$/i, '').trim();\n  analysis = JSON.parse(cleaned);\n} catch (e) {\n  analysis = {\n    sentiment: 'neutral',\n    urgency: 'low',\n    response_draft: 'Thank you for your feedback!',\n    action_required: 'none'\n  };\n}\n\nconst review = $input.all()[0].json;\n\nlet alertChannel = '#reviews';\nif (analysis.urgency === 'critical') alertChannel = '#urgent-reviews';\nelse if (analysis.urgency === 'high') alertChannel = '#negative-reviews';\n\nreturn [{\n  json: {\n    alert_id: 'REV-' + Date.now(),\n    review_id: review.review_id,\n    platform: review.platform,\n    rating: review.rating,\n    reviewer_name: review.reviewer_name,\n    review_text: review.review_text,\n    sentiment: analysis.sentiment,\n    urgency: analysis.urgency,\n    response_draft: analysis.response_draft,\n    action_required: analysis.action_required,\n    alert_channel: alertChannel,\n    notification_sent: true,\n    escalated_to: analysis.urgency === 'critical' ? 'manager' : null,\n    timestamp: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "code-process",
+      "name": "Process Analysis",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1050, 300]
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "tableId": "review_alerts",
+        "fields": [
+          {
+            "fieldId": "alert_id",
+            "value": "={{ $json.alert_id }}"
+          },
+          {
+            "fieldId": "review_id",
+            "value": "={{ $json.review_id }}"
+          },
+          {
+            "fieldId": "platform",
+            "value": "={{ $json.platform }}"
+          },
+          {
+            "fieldId": "rating",
+            "value": "={{ $json.rating }}"
+          },
+          {
+            "fieldId": "sentiment",
+            "value": "={{ $json.sentiment }}"
+          },
+          {
+            "fieldId": "urgency",
+            "value": "={{ $json.urgency }}"
+          },
+          {
+            "fieldId": "response_draft",
+            "value": "={{ $json.response_draft }}"
+          },
+          {
+            "fieldId": "created_at",
+            "value": "={{ $json.timestamp }}"
+          }
+        ]
+      },
+      "id": "supabase-store",
+      "name": "Store Alert",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [1250, 200],
+      "credentials": {
+        "supabaseApi": {
+          "id": "YOUR_SUPABASE_CREDENTIAL_ID",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "channel": "={{ $json.alert_channel }}",
+        "text": "=⭐ NEW REVIEW ALERT\n\nPlatform: {{ $json.platform }}\nRating: {{ $json.rating }}/5 ⭐\nSentiment: {{ $json.sentiment }}\nUrgency: {{ $json.urgency }}\n\nReviewer: {{ $json.reviewer_name }}\n\"{{ $json.review_text.substring(0, 200) }}...\"\n\n💬 Suggested Response:\n{{ $json.response_draft }}\n\n{{ $json.escalated_to ? '⚠️ Escalated to: ' + $json.escalated_to : '' }}",
+        "otherOptions": {}
+      },
+      "id": "slack-notify",
+      "name": "Notify Slack",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [1250, 400],
+      "credentials": {
+        "slackApi": {
+          "id": "YOUR_SLACK_CREDENTIAL_ID",
+          "name": "Slack account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "condition-1",
+              "leftValue": "={{ $json.urgency }}",
+              "rightValue": "critical",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "if-critical",
+      "name": "Critical?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1450, 400]
+    },
+    {
+      "parameters": {
+        "to": "=manager@yourcompany.com",
+        "subject": "=🚨 CRITICAL REVIEW ALERT",
+        "text": "=A critical review requires immediate attention.\\n\\nRating: {{ $json.rating }}/5\\nReview: {{ $json.review_text }}\\n\\nCheck Slack for details.",
+        "options": {}
+      },
+      "id": "email-alert",
+      "name": "Email Manager",
+      "type": "n8n-nodes-base.sendEmail",
+      "typeVersion": 2,
+      "position": [1650, 350]
+    }
+  ],
+  "connections": {
+    "Schedule: Every 15 Min": {
+      "main": [
+        [
+          {
+            "node": "Fetch Google Reviews",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Get Recent Alerts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Google Reviews": {
+      "main": [
+        [
+          {
+            "node": "Filter New Reviews",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Recent Alerts": {
+      "main": [
+        [
+          {
+            "node": "Filter New Reviews",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Filter New Reviews": {
+      "main": [
+        [
+          {
+            "node": "AI: Analyze Review",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI: Analyze Review": {
+      "main": [
+        [
+          {
+            "node": "Process Analysis",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Process Analysis": {
+      "main": [
+        [
+          {
+            "node": "Store Alert",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Notify Slack",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify Slack": {
+      "main": [
+        [
+          {
+            "node": "Critical?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Critical?": {
+      "main": [
+        [
+          {
+            "node": "Email Manager",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true
+  },
+  "tags": ["d2c", "support", "reviews", "scheduled", "fixed"],
+  "pinData": {}
+}

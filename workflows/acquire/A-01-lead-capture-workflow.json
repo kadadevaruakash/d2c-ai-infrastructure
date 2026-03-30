@@ -1,0 +1,279 @@
+{
+  "name": "A-01: Lead Capture & Qualification Agent",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "a01-lead-capture",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-receive",
+      "name": "Webhook: Receive Lead",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [250, 300],
+      "webhookId": "a01-lead-capture"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse and validate incoming lead data\nconst input = $input.first().json.body || $input.first().json;\n\nconst required = ['name', 'email'];\nconst missing = required.filter(f => !input[f]);\n\nif (missing.length > 0) {\n  return [{\n    json: {\n      error: true,\n      message: `Missing required fields: ${missing.join(', ')}`\n    }\n  }];\n}\n\nreturn [{\n  json: {\n    name: input.name,\n    email: input.email,\n    phone: input.phone || null,\n    company: input.company || null,\n    budget_range: input.budget_range || 'unknown',\n    niche: input.niche || 'unknown',\n    urgency: input.urgency || 'medium',\n    source: input.source || 'direct',\n    utm_params: input.utm_params || {},\n    timestamp: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "code-parse",
+      "name": "Parse & Validate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [450, 300]
+    },
+    {
+      "parameters": {
+        "model": "gpt-4o-mini",
+        "options": {},
+        "messages": {
+          "message": [
+            {
+              "role": "system",
+              "content": "You are a lead qualification specialist for a D2C brand. Score leads 0-100 based on: budget fit (30%), niche alignment (30%), urgency (25%), completeness (15%). Return ONLY valid JSON."
+            },
+            {
+              "role": "user",
+              "content": "=Lead details:\nName: {{ $json.name }}\nEmail: {{ $json.email }}\nCompany: {{ $json.company }}\nBudget: {{ $json.budget_range }}\nNiche: {{ $json.niche }}\nUrgency: {{ $json.urgency }}\n\nReturn JSON format:\n{\"score\": number, \"category\": \"hot|warm|cold\", \"action\": \"string\", \"priority\": \"high|medium|low\"}"
+            }
+          ]
+        }
+      },
+      "id": "openai-score",
+      "name": "AI: Score Lead",
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1,
+      "position": [650, 300],
+      "credentials": {
+        "openAiApi": {
+          "id": "YOUR_OPENAI_CREDENTIAL_ID",
+          "name": "OpenAI account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse AI response and enrich\nconst aiResponse = $input.first().json.content;\nlet scoring;\n\ntry {\n  scoring = JSON.parse(aiResponse);\n} catch (e) {\n  // Fallback if AI doesn't return valid JSON\n  scoring = {\n    score: 50,\n    category: 'warm',\n    action: 'Add to nurture sequence',\n    priority: 'medium'\n  };\n}\n\nconst lead = $input.all()[0].json;\n\nreturn [{\n  json: {\n    lead_id: 'LEAD-' + Date.now(),\n    ...lead,\n    score: scoring.score,\n    category: scoring.category,\n    next_action: scoring.action,\n    priority: scoring.priority,\n    qualified: scoring.score >= 50,\n    processed_at: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "code-enrich",
+      "name": "Enrich Lead Data",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [850, 300]
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "tableId": "leads",
+        "fields": [
+          {
+            "fieldId": "lead_id",
+            "value": "={{ $json.lead_id }}"
+          },
+          {
+            "fieldId": "name",
+            "value": "={{ $json.name }}"
+          },
+          {
+            "fieldId": "email",
+            "value": "={{ $json.email }}"
+          },
+          {
+            "fieldId": "phone",
+            "value": "={{ $json.phone }}"
+          },
+          {
+            "fieldId": "company",
+            "value": "={{ $json.company }}"
+          },
+          {
+            "fieldId": "score",
+            "value": "={{ $json.score }}"
+          },
+          {
+            "fieldId": "category",
+            "value": "={{ $json.category }}"
+          },
+          {
+            "fieldId": "priority",
+            "value": "={{ $json.priority }}"
+          },
+          {
+            "fieldId": "source",
+            "value": "={{ $json.source }}"
+          },
+          {
+            "fieldId": "created_at",
+            "value": "={{ $json.processed_at }}"
+          }
+        ]
+      },
+      "id": "supabase-store",
+      "name": "Store in Supabase",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [1050, 200],
+      "credentials": {
+        "supabaseApi": {
+          "id": "YOUR_SUPABASE_CREDENTIAL_ID",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "condition-1",
+              "leftValue": "={{ $json.category }}",
+              "rightValue": "hot",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "if-hot-lead",
+      "name": "Hot Lead?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1050, 400]
+    },
+    {
+      "parameters": {
+        "channel": "=#leads",
+        "text": "=🔥 HOT LEAD ALERT\n\nName: {{ $json.name }}\nEmail: {{ $json.email }}\nCompany: {{ $json.company || 'N/A' }}\nScore: {{ $json.score }}/100\nAction: {{ $json.next_action }}",
+        "otherOptions": {}
+      },
+      "id": "slack-notify",
+      "name": "Notify Slack",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [1250, 350],
+      "credentials": {
+        "slackApi": {
+          "id": "YOUR_SLACK_CREDENTIAL_ID",
+          "name": "Slack account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "json": "={\"status\": \"success\", \"lead_id\": \"{{ $json.lead_id }}\", \"message\": \"Thank you! We'll be in touch within 24 hours.\", \"category\": \"{{ $json.category }}\"}",
+        "options": {}
+      },
+      "id": "webhook-response",
+      "name": "Return Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1450, 300]
+    }
+  ],
+  "connections": {
+    "Webhook: Receive Lead": {
+      "main": [
+        [
+          {
+            "node": "Parse & Validate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse & Validate": {
+      "main": [
+        [
+          {
+            "node": "AI: Score Lead",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI: Score Lead": {
+      "main": [
+        [
+          {
+            "node": "Enrich Lead Data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Enrich Lead Data": {
+      "main": [
+        [
+          {
+            "node": "Store in Supabase",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Hot Lead?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Hot Lead?": {
+      "main": [
+        [
+          {
+            "node": "Notify Slack",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "Store in Supabase": {
+      "main": [
+        [
+          {
+            "node": "Return Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify Slack": {
+      "main": [
+        [
+          {
+            "node": "Return Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": ""
+  },
+  "staticData": null,
+  "tags": ["d2c", "acquire", "lead-capture"],
+  "pinData": {}
+}

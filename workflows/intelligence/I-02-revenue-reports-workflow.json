@@ -1,0 +1,348 @@
+{
+  "name": "I-02: Revenue & Expense Reporting Agent",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "expression": "0 8 * * *"
+            }
+          ]
+        }
+      },
+      "id": "schedule-trigger",
+      "name": "Schedule: Daily 8 AM",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1,
+      "position": [250, 300]
+    },
+    {
+      "parameters": {
+        "operation": "getAll",
+        "resource": "order",
+        "limit": 500,
+        "filters": {
+          "created_at_min": "={{ DateTime.now().minus({ days: 1 }).toISO() }}"
+        },
+        "options": {}
+      },
+      "id": "shopify-orders",
+      "name": "Get Shopify Orders",
+      "type": "n8n-nodes-base.shopify",
+      "typeVersion": 1,
+      "position": [450, 200],
+      "credentials": {
+        "shopifyApi": {
+          "id": "YOUR_SHOPIFY_CREDENTIAL_ID",
+          "name": "Shopify account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "getAll",
+        "resource": "report",
+        "fields": "campaign_name,spend,impressions,clicks,conversions",
+        "filters": {
+          "date_preset": "yesterday"
+        }
+      },
+      "id": "meta-ads",
+      "name": "Get Meta Ad Spend",
+      "type": "n8n-nodes-base.facebookGraphApi",
+      "typeVersion": 1,
+      "position": [450, 400],
+      "credentials": {
+        "facebookGraphApi": {
+          "id": "YOUR_META_CREDENTIAL_ID",
+          "name": "Meta account"
+        }
+      },
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// Calculate revenue metrics\nconst orders = $input.all()[0]?.json || [];\nconst adData = $input.all()[1]?.json || { data: [] };\n\nconst yesterday = DateTime.now().minus({ days: 1 });\n\n// Revenue calculations\nconst totalRevenue = orders.reduce((sum, o) => sum + parseFloat(o.total_price || 0), 0);\nconst totalOrders = orders.length;\nconst aov = totalOrders > 0 ? totalRevenue / totalOrders : 0;\nconst refunds = orders.filter(o => o.financial_status === 'refunded').length;\nconst refundAmount = orders\n  .filter(o => o.financial_status === 'refunded')\n  .reduce((sum, o) => sum + parseFloat(o.total_price || 0), 0);\n\n// Ad spend calculations\nconst adSpend = adData.data?.reduce((sum, a) => sum + parseFloat(a.spend || 0), 0) || 0;\nconst roas = adSpend > 0 ? (totalRevenue / adSpend).toFixed(2) : 0;\n\n// Previous day comparison (mock data - replace with actual fetch)\nconst prevDayRevenue = totalRevenue * 0.95; // Placeholder\nconst revenueChange = ((totalRevenue - prevDayRevenue) / prevDayRevenue * 100).toFixed(1);\n\nreturn [{\n  json: {\n    date: yesterday.toFormat('yyyy-MM-dd'),\n    revenue: totalRevenue.toFixed(2),\n    orders: totalOrders,\n    aov: aov.toFixed(2),\n    refunds: refunds,\n    refund_amount: refundAmount.toFixed(2),\n    ad_spend: adSpend.toFixed(2),\n    roas: roas,\n    revenue_change: revenueChange,\n    gross_margin: ((totalRevenue - adSpend) / totalRevenue * 100).toFixed(1),\n    generated_at: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "code-calculate",
+      "name": "Calculate Metrics",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [650, 300]
+    },
+    {
+      "parameters": {
+        "model": "gpt-4o-mini",
+        "options": {},
+        "messages": {
+          "message": [
+            {
+              "role": "system",
+              "content": "You are a financial analyst for a D2C brand. Analyze daily performance vs previous day, flag anomalies (>20% variance), calculate key ratios. Be concise, highlight concerning trends. Round to whole numbers."
+            },
+            {
+              "role": "user",
+              "content": "=Date: {{ $json.date }}\nRevenue: ${{ $json.revenue }} ({{ $json.revenue_change }}% vs yesterday)\nOrders: {{ $json.orders }}\nAOV: ${{ $json.aov }}\nAd Spend: ${{ $json.ad_spend }}\nROAS: {{ $json.roas }}x\nRefunds: {{ $json.refunds }} (${{ $json.refund_amount }})\nGross Margin: {{ $json.gross_margin }}%\n\nProvide a brief analysis with any anomalies flagged."
+            }
+          ]
+        }
+      },
+      "id": "openai-analyze",
+      "name": "AI: Analyze Performance",
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1,
+      "position": [850, 300],
+      "credentials": {
+        "openAiApi": {
+          "id": "YOUR_OPENAI_CREDENTIAL_ID",
+          "name": "OpenAI account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Check for anomalies\nconst data = $input.all()[0].json;\nconst analysis = $input.all()[1].json.content;\n\nconst anomalies = [];\n\nif (parseFloat(data.roas) < 2.0) {\n  anomalies.push(`ROAS dropped to ${data.roas}x`);\n}\nif (parseFloat(data.revenue_change) < -20) {\n  anomalies.push(`Revenue down ${data.revenue_change}%`);\n}\nif (parseFloat(data.gross_margin) < 30) {\n  anomalies.push(`Margin at ${data.gross_margin}%`);\n}\n\nreturn [{\n  json: {\n    ...data,\n    analysis: analysis,\n    has_anomalies: anomalies.length > 0,\n    anomalies: anomalies,\n    alert_level: anomalies.length > 2 ? 'critical' : anomalies.length > 0 ? 'warning' : 'normal'\n  }\n}];"
+      },
+      "id": "code-anomaly",
+      "name": "Detect Anomalies",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1050, 300]
+    },
+    {
+      "parameters": {
+        "channel": "=#daily-revenue",
+        "text": "=:calendar: DAILY P&L REPORT — {{ $json.date }}\n\n:moneybag: Revenue: ${{ $json.revenue }} ({{ $json.revenue_change }}% vs yesterday)\n:shopping_cart: Orders: {{ $json.orders }} | AOV: ${{ $json.aov }}\n:chart_with_upwards_trend: ROAS: {{ $json.roas }}x | Ad Spend: ${{ $json.ad_spend }}\n:warning: Refunds: {{ $json.refunds }} (${{ $json.refund_amount }})\n:green_book: Gross Margin: {{ $json.gross_margin }}%\n\n{{ $json.has_anomalies ? '\\n:rotating_light: ANOMALIES DETECTED:\\n' + $json.anomalies.map(a => '• ' + a).join('\\n') : '\\n:white_check_mark: No anomalies detected' }}\n\n:thought_balloon: Analysis:\n{{ $json.analysis }}",
+        "otherOptions": {}
+      },
+      "id": "slack-report",
+      "name": "Send to Slack",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [1250, 200],
+      "credentials": {
+        "slackApi": {
+          "id": "YOUR_SLACK_CREDENTIAL_ID",
+          "name": "Slack account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "condition-1",
+              "leftValue": "={{ $json.has_anomalies }}",
+              "rightValue": "true",
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "if-anomaly",
+      "name": "Has Anomalies?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1250, 400]
+    },
+    {
+      "parameters": {
+        "to": "=ops@yourcompany.com",
+        "subject": "=🚨 Revenue Alert: {{ $json.alert_level === 'critical' ? 'CRITICAL' : 'WARNING' }} — {{ $json.date }}",
+        "text": "=Daily P&L Report — {{ $json.date }}\\n\\nRevenue: ${{ $json.revenue }}\\nROAS: {{ $json.roas }}x\\n\\nANOMALIES:\\n{{ $json.anomalies.join('\\n') }}\\n\\nImmediate attention may be required.",
+        "options": {}
+      },
+      "id": "email-alert",
+      "name": "Send Email Alert",
+      "type": "n8n-nodes-base.sendEmail",
+      "typeVersion": 2,
+      "position": [1450, 350]
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": "={{ $env.GOOGLE_SHEETS_DOC_ID }}",
+        "sheetName": "Daily Reports",
+        "columns": {
+          "columnValues": [
+            {
+              "column": "Date",
+              "value": "={{ $json.date }}"
+            },
+            {
+              "column": "Revenue",
+              "value": "={{ $json.revenue }}"
+            },
+            {
+              "column": "Orders",
+              "value": "={{ $json.orders }}"
+            },
+            {
+              "column": "AOV",
+              "value": "={{ $json.aov }}"
+            },
+            {
+              "column": "Ad Spend",
+              "value": "={{ $json.ad_spend }}"
+            },
+            {
+              "column": "ROAS",
+              "value": "={{ $json.roas }}"
+            },
+            {
+              "column": "Gross Margin %",
+              "value": "={{ $json.gross_margin }}"
+            },
+            {
+              "column": "Has Anomalies",
+              "value": "={{ $json.has_anomalies }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "sheets-log",
+      "name": "Log to Google Sheets",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4,
+      "position": [1650, 300],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "YOUR_GOOGLE_CREDENTIAL_ID",
+          "name": "Google Sheets account"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Schedule: Daily 8 AM": {
+      "main": [
+        [
+          {
+            "node": "Get Shopify Orders",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Get Meta Ad Spend",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Shopify Orders": {
+      "main": [
+        [
+          {
+            "node": "Calculate Metrics",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Meta Ad Spend": {
+      "main": [
+        [
+          {
+            "node": "Calculate Metrics",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Calculate Metrics": {
+      "main": [
+        [
+          {
+            "node": "AI: Analyze Performance",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI: Analyze Performance": {
+      "main": [
+        [
+          {
+            "node": "Detect Anomalies",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Detect Anomalies": {
+      "main": [
+        [
+          {
+            "node": "Send to Slack",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Has Anomalies?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has Anomalies?": {
+      "main": [
+        [
+          {
+            "node": "Send Email Alert",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "Send to Slack": {
+      "main": [
+        [
+          {
+            "node": "Log to Google Sheets",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Email Alert": {
+      "main": [
+        [
+          {
+            "node": "Log to Google Sheets",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "tags": ["d2c", "intelligence", "revenue", "scheduled"],
+  "pinData": {}
+}

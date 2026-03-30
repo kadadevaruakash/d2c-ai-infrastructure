@@ -1,0 +1,302 @@
+{
+  "name": "A-03: Instagram DM Automation Agent [FIXED]",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "a03-ig-dm",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-trigger",
+      "name": "Webhook: IG Event",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [250, 300],
+      "webhookId": "a03-ig-dm"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse Instagram webhook (Meta Webhook format)\n// sender.id is the IGSID — required for Instagram Messaging API\nconst body = $input.first().json.body || $input.first().json;\n\n// Meta Webhooks for Instagram send events in this shape:\n// { entry: [{ messaging: [{ sender: { id }, recipient: { id }, message: { text } }] }] }\nlet igsid, username, messageText, postId;\n\nif (body.entry?.[0]?.messaging?.[0]) {\n  // Standard Meta webhook format\n  const msg = body.entry[0].messaging[0];\n  igsid = msg.sender?.id;\n  messageText = msg.message?.text || '';\n  postId = msg.message?.reply_to?.story?.id || null;\n  username = body.username || msg.sender?.id; // username not always available\n} else {\n  // ManyChat / custom webhook format fallback\n  igsid = body.igsid || body.user_id;\n  username = body.username;\n  messageText = body.message_text || body.comment_text || '';\n  postId = body.post_id || null;\n}\n\nif (!igsid) {\n  throw new Error('Missing IGSID — Instagram Messaging API requires sender IGSID, not username');\n}\n\nreturn [{\n  json: {\n    event_type: body.event_type || 'message',\n    igsid: igsid,\n    username: username || igsid,\n    message_text: messageText,\n    post_id: postId,\n    keywords_detected: body.keywords_detected || [],\n    detected_product: body.detected_product || null\n  }\n}];"
+      },
+      "id": "code-parse",
+      "name": "Parse Event",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [450, 300]
+    },
+    {
+      "parameters": {
+        "model": "gpt-4o-mini",
+        "options": {},
+        "messages": {
+          "message": [
+            {
+              "role": "system",
+              "content": "You are an Instagram community manager. Generate a friendly, casual DM response. If high intent (price, buy, order), include product link. If very high intent, offer Calendly. Max 3 sentences. Use emojis sparingly."
+            },
+            {
+              "role": "user",
+              "content": "=User: @{{ $json.username }}\nMessage: '{{ $json.message_text }}'\nKeywords: {{ $json.keywords_detected.join(', ') }}\nProduct interest: {{ $json.detected_product }}\n\nReturn JSON:\n{\"dm_text\": \"string\", \"product_linked\": boolean, \"calendly_offered\": boolean, \"intent_score\": number (0-100)}"
+            }
+          ]
+        }
+      },
+      "id": "openai-generate",
+      "name": "AI: Generate DM",
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1,
+      "position": [650, 300],
+      "credentials": {
+        "openAiApi": {
+          "id": "YOUR_OPENAI_CREDENTIAL_ID",
+          "name": "OpenAI account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build response with links\nconst aiResponseText = $input.first().json.content;\nlet result;\n\ntry {\n  const cleaned = aiResponseText.replace(/^```json\\s*/i, '').replace(/^```\\s*/i, '').replace(/```\\s*$/i, '').trim();\n  result = JSON.parse(cleaned);\n} catch (e) {\n  result = {\n    dm_text: aiResponseText,\n    product_linked: false,\n    calendly_offered: false,\n    intent_score: 50\n  };\n}\n\nconst event = $input.all()[0].json;\nlet dmText = result.dm_text;\nlet bookingUrl = null;\n\nif (result.product_linked && event.detected_product) {\n  dmText += `\\n\\n🔗 Check it out: https://yourstore.com/products/${event.detected_product}`;\n}\n\nif (result.calendly_offered || result.intent_score > 80) {\n  bookingUrl = `https://calendly.com/yourname/15min`;\n  dmText += `\\n\\n📅 Want to chat? Book here: ${bookingUrl}`;\n}\n\nreturn [{\n  json: {\n    igsid: event.igsid,\n    username: event.username,\n    dm_text: dmText,\n    product_linked: result.product_linked,\n    calendly_offered: result.calendly_offered || result.intent_score > 80,\n    intent_score: result.intent_score,\n    booking_url: bookingUrl,\n    timestamp: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "code-build",
+      "name": "Build Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [850, 300]
+    },
+    {
+      "parameters": {
+        "url": "=https://graph.instagram.com/v19.0/me/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpQueryAuth",
+        "method": "POST",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "recipient",
+              "value": "={{ JSON.stringify({ id: $json.igsid }) }}"
+            },
+            {
+              "name": "message",
+              "value": "={{ JSON.stringify({ text: $json.dm_text }) }}"
+            },
+            {
+              "name": "access_token",
+              "value": "={{ $env.INSTAGRAM_ACCESS_TOKEN }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "http-ig-dm",
+      "name": "Send IG DM",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [1050, 200]
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "tableId": "ig_interactions",
+        "fields": [
+          {
+            "fieldId": "username",
+            "value": "={{ $json.username }}"
+          },
+          {
+            "fieldId": "dm_text",
+            "value": "={{ $json.dm_text }}"
+          },
+          {
+            "fieldId": "intent_score",
+            "value": "={{ $json.intent_score }}"
+          },
+          {
+            "fieldId": "product_linked",
+            "value": "={{ $json.product_linked }}"
+          },
+          {
+            "fieldId": "calendly_offered",
+            "value": "={{ $json.calendly_offered }}"
+          },
+          {
+            "fieldId": "created_at",
+            "value": "={{ $json.timestamp }}"
+          }
+        ]
+      },
+      "id": "supabase-log",
+      "name": "Log Interaction",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [1250, 300],
+      "credentials": {
+        "supabaseApi": {
+          "id": "YOUR_SUPABASE_CREDENTIAL_ID",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "condition-1",
+              "leftValue": "={{ $json.intent_score }}",
+              "rightValue": "70",
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "if-high-intent",
+      "name": "High Intent?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1050, 400]
+    },
+    {
+      "parameters": {
+        "channel": "=#hot-leads",
+        "text": "=🔥 HIGH INTENT IG LEAD\n\nUsername: @{{ $json.username }}\nIntent Score: {{ $json.intent_score }}/100\nCalendly: {{ $json.calendly_offered ? 'Offered' : 'No' }}\n\n{{ $json.booking_url ? 'Booking URL: ' + $json.booking_url : '' }}",
+        "otherOptions": {}
+      },
+      "id": "slack-notify",
+      "name": "Notify Slack",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [1250, 400],
+      "credentials": {
+        "slackApi": {
+          "id": "YOUR_SLACK_CREDENTIAL_ID",
+          "name": "Slack account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "json": "={\"status\": \"sent\", \"username\": \"{{ $json.username }}\", \"intent_score\": {{ $json.intent_score }}}",
+        "options": {}
+      },
+      "id": "webhook-response",
+      "name": "Return Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1450, 300]
+    }
+  ],
+  "connections": {
+    "Webhook: IG Event": {
+      "main": [
+        [
+          {
+            "node": "Parse Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Event": {
+      "main": [
+        [
+          {
+            "node": "AI: Generate DM",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI: Generate DM": {
+      "main": [
+        [
+          {
+            "node": "Build Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Response": {
+      "main": [
+        [
+          {
+            "node": "Send IG DM",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "High Intent?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send IG DM": {
+      "main": [
+        [
+          {
+            "node": "Log Interaction",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "High Intent?": {
+      "main": [
+        [
+          {
+            "node": "Notify Slack",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "Notify Slack": {
+      "main": [
+        [
+          {
+            "node": "Log Interaction",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Interaction": {
+      "main": [
+        [
+          {
+            "node": "Return Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true
+  },
+  "tags": ["d2c", "acquire", "instagram", "dm", "fixed"],
+  "pinData": {}
+}
