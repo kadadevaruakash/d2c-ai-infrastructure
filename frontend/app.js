@@ -1,1507 +1,1423 @@
 'use strict';
 
 /* ════════════════════════════════════════════════
-   D2C AI Growth Suite — Frontend Application
+   D2C AI Growth Suite — Frontend Application v2
    ════════════════════════════════════════════════ */
 
 // ── State ─────────────────────────────────────────
 const state = {
   slug:   null,
   key:    null,
+  demo:   false,
   config: null,
   cache:  {},
-  demo:   false,
+  agencyKey: null,
+  sseSource: null,
+  feedItems: [],
+  demoFeedTimer: null,
 };
 
-// ── Cascade display map (mirrors api/orchestrator.js CASCADE_MAP) ─────────
-const CASCADE_DISPLAY = {
-  'A-01': [{ to: 'SC-03', label: 'Hot lead → sales follow-up' }],
-  'C-01': [{ to: 'I-03',  label: 'Repeated abandonment → churn intel' }],
-  'C-04': [{ to: 'I-03',  label: 'Gamification engaged → customer intel' }],
-  'R-01': [{ to: 'R-02',  label: 'New order → loyalty points' }, { to: 'I-03', label: 'New order → customer intel' }],
-  'R-02': [{ to: 'S-04',  label: 'Tier upgrade → CEO alert' }],
-  'I-03': [{ to: 'R-04',  label: 'High churn risk → winback' }],
-  'S-01': [{ to: 'S-02',  label: 'Query → RAG lookup' }, { to: 'S-04', label: 'Escalated → CEO alert' }],
-  'S-02': [{ to: 'S-04',  label: 'Low confidence → CEO escalation' }],
-  'S-03': [{ to: 'S-04',  label: 'Critical review → CEO alert' }, { to: 'SC-04', label: 'Product mention → refresh SEO' }],
-  'SC-03':[{ to: 'A-01',  label: 'High intent → create lead' }],
-  'SC-04':[{ to: 'A-04',  label: 'New product → generate content' }],
-};
-
-// Which workflows receive cascades from others (reverse map — for "triggered by" display)
-const CASCADE_RECEIVES = (function () {
-  var r = {};
-  Object.keys(CASCADE_DISPLAY).forEach(function (from) {
-    CASCADE_DISPLAY[from].forEach(function (c) {
-      if (!r[c.to]) r[c.to] = [];
-      r[c.to].push({ from: from, label: c.label });
-    });
-  });
-  return r;
-}());
-
-// ── Per-workflow config options ───────────────────────
-// Each entry: { key, label, type, default, description, options? }
-// Stored as JSON in workflow_states.config_overrides
-
-const WORKFLOW_CONFIG = {
-  'A-01': [
-    { key: 'hot_score',       label: 'Hot lead threshold',   type: 'number', default: 75,   desc: 'Score ≥ this triggers Slack hot-lead alert + SC-03 cascade' },
-    { key: 'auto_enrich',     label: 'Auto-enrich leads',    type: 'bool',   default: true,  desc: 'Attempt to enrich missing fields before scoring' },
-    { key: 'notify_all',      label: 'Notify on every lead', type: 'bool',   default: false, desc: 'Send Slack notification for warm/cold leads too' },
-    { key: 'sources',         label: 'Tracked sources',      type: 'text',   default: 'website_form,chatbot,ads', desc: 'Comma-separated list of accepted source values' },
-  ],
-  'A-02': [
-    { key: 'daily_limit',     label: 'Daily send limit',     type: 'number', default: 50,    desc: 'Max cold emails per day' },
-    { key: 'send_hour',       label: 'Send hour (UTC)',       type: 'number', default: 9,     desc: '0–23, hour at which the daily batch runs' },
-    { key: 'tone',            label: 'Email tone',           type: 'select', default: 'professional', options: ['professional','friendly','bold','concise'], desc: 'AI writing tone for generated emails' },
-    { key: 'subject_prefix',  label: 'Subject prefix',       type: 'text',   default: '',    desc: 'Optional prefix prepended to every subject line' },
-  ],
-  'A-03': [
-    { key: 'auto_reply',      label: 'Auto-reply enabled',   type: 'bool',   default: true,  desc: 'Send AI-generated reply without human approval' },
-    { key: 'reply_delay_s',   label: 'Reply delay (secs)',   type: 'number', default: 3,     desc: 'Seconds to wait before sending — prevents instant-bot feel' },
-    { key: 'cta_type',        label: 'Call to action',       type: 'select', default: 'shop', options: ['shop','book','learn','none'], desc: 'CTA injected at end of each reply' },
-    { key: 'escalate_words',  label: 'Escalation keywords',  type: 'text',   default: 'refund,broken,angry,lawyer', desc: 'Comma-separated words that trigger human escalation' },
-  ],
-  'A-04': [
-    { key: 'frequency',       label: 'Run frequency',        type: 'select', default: 'weekly', options: ['daily','weekly','biweekly'], desc: 'How often to generate new content' },
-    { key: 'min_words',       label: 'Min word count',       type: 'number', default: 1200,  desc: 'Target minimum word count for generated articles' },
-    { key: 'post_to_blog',    label: 'Auto-post to blog',    type: 'bool',   default: false, desc: 'Publish directly via Shopify blog API after generation' },
-    { key: 'keywords',        label: 'Seed keywords',        type: 'text',   default: '',    desc: 'Comma-separated keywords; rotated each run' },
-  ],
-  'C-01': [
-    { key: 'delay_1h_pct',    label: '1h discount %',        type: 'number', default: 0,     desc: 'Discount % for first recovery email (0 = no discount)' },
-    { key: 'delay_4h_pct',    label: '4h discount %',        type: 'number', default: 5,     desc: 'Discount % for second recovery email' },
-    { key: 'delay_24h_pct',   label: '24h discount %',       type: 'number', default: 10,    desc: 'Discount % for final recovery email' },
-    { key: 'channels',        label: 'Recovery channels',    type: 'text',   default: 'email,whatsapp', desc: 'Comma-separated: email, whatsapp, sms' },
-    { key: 'min_cart_value',  label: 'Min cart value ($)',   type: 'number', default: 20,    desc: 'Ignore abandoned carts below this value' },
-  ],
-  'C-02': [
-    { key: 'early_access_h',  label: 'VIP early access (hrs)', type: 'number', default: 2,   desc: 'Hours before public announcement VIPs are notified' },
-    { key: 'min_restock_qty', label: 'Min restock qty',      type: 'number', default: 5,     desc: 'Only alert if restocked quantity exceeds this' },
-    { key: 'send_whatsapp',   label: 'WhatsApp alerts',      type: 'bool',   default: true,  desc: 'Send WhatsApp notifications in addition to email' },
-  ],
-  'C-03': [
-    { key: 'max_per_run',     label: 'Listings per run',     type: 'number', default: 10,    desc: 'Max Amazon listings to optimise per weekly run' },
-    { key: 'require_approval',label: 'Require approval',     type: 'bool',   default: true,  desc: 'Post to Slack for approval before applying changes' },
-    { key: 'focus_on',        label: 'Optimise focus',       type: 'select', default: 'both', options: ['title','bullets','both'], desc: 'Which listing elements to rewrite' },
-  ],
-  'C-04': [
-    { key: 'game_types',      label: 'Game types',           type: 'text',   default: 'spin_wheel,mystery_box,progress_bar', desc: 'Comma-separated game types AI can choose from' },
-    { key: 'min_cart_value',  label: 'Min cart value ($)',   type: 'number', default: 30,    desc: 'Gamification only activates above this cart value' },
-    { key: 'discount_min',    label: 'Min discount %',       type: 'number', default: 5,     desc: 'Smallest discount that can be awarded' },
-    { key: 'discount_max',    label: 'Max discount %',       type: 'number', default: 20,    desc: 'Largest discount that can be awarded' },
-  ],
-  'I-01': [
-    { key: 'check_freq',      label: 'Check frequency',      type: 'select', default: 'daily', options: ['hourly','daily','weekly'], desc: 'How often to scrape competitor sites' },
-    { key: 'threat_threshold',label: 'Alert threshold (1-5)',type: 'number', default: 3,     desc: 'Threat level at which Slack alert fires' },
-    { key: 'track_pricing',   label: 'Track pricing',        type: 'bool',   default: true,  desc: 'Watch for price changes on competitor products' },
-    { key: 'track_copy',      label: 'Track copy changes',   type: 'bool',   default: true,  desc: 'Detect headline and description changes' },
-    { key: 'competitors',     label: 'Competitor URLs',      type: 'text',   default: '',    desc: 'Comma-separated URLs to monitor' },
-  ],
-  'I-02': [
-    { key: 'report_hour',     label: 'Report hour (UTC)',    type: 'number', default: 7,     desc: 'Hour daily revenue report is generated and sent' },
-    { key: 'roas_threshold',  label: 'ROAS alert threshold', type: 'number', default: 2.0,   desc: 'Alert when ROAS drops below this value' },
-    { key: 'margin_threshold',label: 'Margin alert %',       type: 'number', default: 30,    desc: 'Alert when gross margin drops below this %' },
-    { key: 'include_channels',label: 'Ad channels',          type: 'text',   default: 'meta,google', desc: 'Comma-separated ad channels to include in ROAS' },
-  ],
-  'I-03': [
-    { key: 'churn_threshold', label: 'Churn risk threshold', type: 'number', default: 0.7,   desc: '0.0–1.0; triggers R-04 winback cascade above this score' },
-    { key: 'ltv_horizon_days',label: 'LTV horizon (days)',   type: 'number', default: 365,   desc: 'Prediction window for lifetime value calculation' },
-    { key: 'auto_winback',    label: 'Auto-trigger winback', type: 'bool',   default: true,  desc: 'Cascade to R-04 automatically when churn risk is high' },
-  ],
-  'I-04': [
-    { key: 'report_day',      label: 'Report day of month',  type: 'number', default: 1,     desc: '1–28, day monthly tax report is generated' },
-    { key: 'jurisdictions',   label: 'Jurisdictions',        type: 'text',   default: 'CA,NY,TX,GB,EU', desc: 'Comma-separated tax jurisdictions to calculate' },
-    { key: 'auto_email',      label: 'Auto-email finance',   type: 'bool',   default: true,  desc: 'Email report to finance_email on completion' },
-  ],
-  'R-01': [
-    { key: 'welcome_delay_m', label: 'Welcome email delay (min)', type: 'number', default: 5, desc: 'Minutes after order to send the welcome/thank-you email' },
-    { key: 'upsell_on_return',label: 'Upsell for returning', type: 'bool',   default: true,  desc: 'Include product recommendations for returning customers' },
-  ],
-  'R-02': [
-    { key: 'purchase_rate',   label: 'Points per $1 spent',  type: 'number', default: 1,     desc: 'Loyalty points earned per dollar spent' },
-    { key: 'referral_bonus',  label: 'Referral bonus pts',   type: 'number', default: 50,    desc: 'Points awarded for a successful referral' },
-    { key: 'review_bonus',    label: 'Review bonus pts',     type: 'number', default: 25,    desc: 'Points awarded for submitting a review' },
-    { key: 'social_bonus',    label: 'Social share bonus pts', type: 'number', default: 10,  desc: 'Points awarded for social media shares' },
-    { key: 'silver_at',       label: 'Silver tier at (pts)', type: 'number', default: 500,   desc: 'Point threshold to reach Silver tier' },
-    { key: 'gold_at',         label: 'Gold tier at (pts)',   type: 'number', default: 1500,  desc: 'Point threshold to reach Gold tier' },
-    { key: 'platinum_at',     label: 'Platinum tier at (pts)', type: 'number', default: 5000, desc: 'Point threshold to reach Platinum tier' },
-  ],
-  'R-03': [
-    { key: 'post_times',      label: 'Post times (UTC)',     type: 'text',   default: '10,14,18', desc: 'Comma-separated hours to post (e.g. 10,14,18)' },
-    { key: 'hashtag_count',   label: 'Hashtags per post',    type: 'number', default: 8,     desc: 'Number of hashtags AI appends to each caption' },
-    { key: 'auto_approve',    label: 'Auto-approve posts',   type: 'bool',   default: false, desc: 'Post without human review (disable for brand safety)' },
-    { key: 'caption_tone',    label: 'Caption tone',         type: 'select', default: 'engaging', options: ['engaging','educational','promotional','minimal'], desc: 'Tone for AI-generated captions' },
-  ],
-  'R-04': [
-    { key: 'stage1_days',     label: 'Stage 1 (days inactive)', type: 'number', default: 60, desc: 'Days of inactivity before Stage 1 winback message' },
-    { key: 'stage2_days',     label: 'Stage 2 (days inactive)', type: 'number', default: 90, desc: 'Days of inactivity before Stage 2 (stronger offer)' },
-    { key: 'stage3_days',     label: 'Stage 3 (days inactive)', type: 'number', default: 120, desc: 'Days before last-chance Stage 3 message' },
-    { key: 'incentive_type',  label: 'Incentive type',       type: 'select', default: 'discount', options: ['discount','free_shipping','gift','none'], desc: 'Type of incentive included in winback emails' },
-    { key: 'max_attempts',    label: 'Max attempts',         type: 'number', default: 3,     desc: 'Stop winback sequence after this many unanswered messages' },
-  ],
-  'S-01': [
-    { key: 'auto_reply',      label: 'Auto-reply enabled',   type: 'bool',   default: true,  desc: 'Send AI reply without human approval' },
-    { key: 'business_hours',  label: 'Business hours (UTC)', type: 'text',   default: '8-20', desc: 'Format: start-end (e.g. 8-20). Auto-reply disabled outside hours' },
-    { key: 'escalate_to',     label: 'Escalate to',          type: 'select', default: 'slack', options: ['slack','email','ceo_whatsapp'], desc: 'Where to route escalated tickets' },
-    { key: 'escalation_score',label: 'Escalation threshold', type: 'number', default: 7,     desc: '1–10 urgency score at which auto-escalation fires' },
-  ],
-  'S-02': [
-    { key: 'confidence_min',  label: 'Confidence threshold', type: 'number', default: 0.5,   desc: '0.0–1.0; answers below this escalate to S-04' },
-    { key: 'max_sources',     label: 'Max KB sources',       type: 'number', default: 5,     desc: 'Max knowledge base chunks retrieved per query' },
-    { key: 'kb_namespace',    label: 'Pinecone namespace',   type: 'text',   default: 'support', desc: 'Pinecone namespace for this tenant knowledge base' },
-  ],
-  'S-03': [
-    { key: 'check_interval_m',label: 'Check interval (min)', type: 'number', default: 15,    desc: 'How often to poll Google My Business for new reviews' },
-    { key: 'critical_rating', label: 'Critical rating ≤',   type: 'number', default: 2,     desc: 'Star rating at or below which review is flagged critical' },
-    { key: 'platforms',       label: 'Review platforms',    type: 'text',   default: 'google', desc: 'Comma-separated: google, trustpilot, shopify' },
-  ],
-  'S-04': [
-    { key: 'digest_hour',     label: 'Daily digest hour (UTC)', type: 'number', default: 8,  desc: 'Hour at which daily CEO digest is sent' },
-    { key: 'severity_filter', label: 'Min severity to alert', type: 'select', default: 'medium', options: ['low','medium','high','critical'], desc: 'Only send alerts at or above this severity' },
-    { key: 'send_whatsapp',   label: 'WhatsApp alerts',     type: 'bool',   default: true,   desc: 'Send CEO alerts via WhatsApp' },
-  ],
-  'SC-01': [
-    { key: 'check_interval_h',label: 'Check interval (hrs)', type: 'number', default: 6,     desc: 'How often to scan Instagram for tagged posts' },
-    { key: 'min_quality',     label: 'Min quality score',   type: 'number', default: 0.6,   desc: '0.0–1.0; posts below this score are discarded' },
-    { key: 'auto_request',    label: 'Auto-request permission', type: 'bool', default: true,  desc: 'Automatically DM creator to request usage rights' },
-  ],
-  'SC-02': [
-    { key: 'report_hour',     label: 'Report hour (UTC)',   type: 'number', default: 8,      desc: 'Hour daily funnel report is generated' },
-    { key: 'drop_alert_pct',  label: 'Drop alert threshold %', type: 'number', default: 20, desc: 'Alert when funnel stage conversion drops by this %' },
-    { key: 'stages',          label: 'Funnel stages',       type: 'text',   default: 'awareness,interest,consideration,checkout,purchase', desc: 'Comma-separated funnel stage names' },
-  ],
-  'SC-03': [
-    { key: 'intent_threshold',label: 'High intent score',   type: 'number', default: 7,     desc: '1–10; signals above this trigger A-01 lead cascade' },
-    { key: 'follow_up_days',  label: 'Follow-up cadence (days)', type: 'text', default: '0,3,7', desc: 'Comma-separated days after signal to follow up' },
-    { key: 'channels',        label: 'Outreach channels',   type: 'text',   default: 'email', desc: 'Comma-separated: email, whatsapp' },
-  ],
-  'SC-04': [
-    { key: 'auto_publish',    label: 'Auto-publish to Shopify', type: 'bool', default: true,  desc: 'Push generated meta tags directly to Shopify product' },
-    { key: 'title_max',       label: 'Title max length',    type: 'number', default: 60,    desc: 'Max characters for SEO meta title' },
-    { key: 'desc_max',        label: 'Description max length', type: 'number', default: 160, desc: 'Max characters for SEO meta description' },
-  ],
-};
-
-// ── Orchestrator SSE state ────────────────────────────
-var sseSource = null;
-var cascadeLog = [];   // ring buffer, max 50 events
-var cascadeLogListeners = [];
-
-function connectOrchestratorFeed() {
-  if (state.demo || !state.slug || !state.key) return;
-  if (sseSource) { sseSource.close(); sseSource = null; }
-
-  var url = '/api/tenants/' + encodeURIComponent(state.slug) + '/events?x-api-key=' + encodeURIComponent(state.key);
-  // EventSource doesn't support custom headers, so pass key as query param and
-  // the server reads it from req.query as a fallback.
-  sseSource = new EventSource(url);
-
-  sseSource.onmessage = function (e) {
-    try {
-      var event = JSON.parse(e.data);
-      cascadeLog.unshift(event);
-      if (cascadeLog.length > 50) cascadeLog.pop();
-      cascadeLogListeners.forEach(function (fn) { try { fn(event); } catch (_) {} });
-    } catch (_) {}
-  };
-
-  sseSource.onerror = function () {
-    // EventSource auto-reconnects; just log
-    console.warn('[SSE] Orchestrator feed connection issue — will retry');
-  };
-}
-
-function onCascadeEvent(fn) {
-  cascadeLogListeners.push(fn);
-  return function off() {
-    cascadeLogListeners = cascadeLogListeners.filter(function (f) { return f !== fn; });
-  };
-}
-
-// ── Workflow manifest ──────────────────────────────
+// ── Category manifest ─────────────────────────────
 const CATEGORIES = [
-  { id: 'acquire', label: 'Acquire', color: '#38bdf8', workflows: [
-    { id: 'A-01', name: 'Lead Capture',     desc: 'Captures and scores inbound leads from web forms' },
-    { id: 'A-02', name: 'Cold Email',        desc: 'AI-personalised cold outreach sequences' },
-    { id: 'A-03', name: 'Instagram DM Bot',  desc: 'Auto-responds to Instagram DMs and story replies' },
-    { id: 'A-04', name: 'SEO Content',       desc: 'Generates SEO-optimised blog and product content' },
-  ]},
-  { id: 'convert', label: 'Convert', color: '#34d399', workflows: [
-    { id: 'C-01', name: 'Cart Recovery',     desc: 'Multi-stage abandoned cart email + WhatsApp recovery' },
-    { id: 'C-02', name: 'Inventory Drop',    desc: 'Back-in-stock alerts across email and WhatsApp' },
-    { id: 'C-03', name: 'Amazon PDP',        desc: 'Optimises Amazon product detail listings with AI' },
-    { id: 'C-04', name: 'Gamified Checkout', desc: 'Discount unlock gamification at checkout' },
-  ]},
-  { id: 'intelligence', label: 'Intelligence', color: '#a78bfa', workflows: [
-    { id: 'I-01', name: 'Competitor Intel',  desc: 'Tracks competitor pricing and positioning changes' },
-    { id: 'I-02', name: 'Revenue Analytics', desc: 'Daily revenue, ROAS, and margin reporting' },
-    { id: 'I-03', name: 'Customer Intel',    desc: 'Customer behaviour analysis and segmentation' },
-    { id: 'I-04', name: 'Tax Reports',       desc: 'Automated tax summary generation' },
-  ]},
-  { id: 'retain', label: 'Retain', color: '#fb923c', workflows: [
-    { id: 'R-01', name: 'CRM Follow-up',     desc: 'Post-purchase CRM sequences and RFM scoring' },
-    { id: 'R-02', name: 'Loyalty Engine',    desc: 'Points, rewards, and tier management' },
-    { id: 'R-03', name: 'Social Automation', desc: 'Automated social posting and engagement' },
-    { id: 'R-04', name: 'Winback',           desc: 'Churn prediction and re-engagement campaigns' },
-  ]},
-  { id: 'support', label: 'Support', color: '#f472b6', workflows: [
-    { id: 'S-01', name: 'WhatsApp Support',  desc: 'AI-powered WhatsApp customer service' },
-    { id: 'S-02', name: 'RAG Brain',         desc: 'Vector-search knowledge base for support queries' },
-    { id: 'S-03', name: 'Review Alerts',     desc: 'Monitors and alerts on new customer reviews' },
-    { id: 'S-04', name: 'CEO Assistant',     desc: 'Daily business digest and decision summaries' },
-  ]},
-  { id: 'scale', label: 'Scale', color: '#fbbf24', workflows: [
-    { id: 'SC-01', name: 'UGC Collect',      desc: 'User-generated content collection and curation' },
-    { id: 'SC-02', name: 'Funnel Analytics', desc: 'Full-funnel conversion analysis via GA4' },
-    { id: 'SC-03', name: 'Sales Automation', desc: 'AI-driven outbound sales signals and follow-up' },
-    { id: 'SC-04', name: 'SEO Meta',         desc: 'Auto-generates SEO meta tags for new products' },
-  ]},
+  {
+    id: 'acquire', label: 'Acquire', cls: 'cat-acquire',
+    workflows: [
+      { id: 'A-01', name: 'Smart Lead Capture',    desc: 'AI-scores leads in real time and routes hot prospects to Slack & Calendly.' },
+      { id: 'A-02', name: 'Outreach Sequencer',    desc: 'Personalised 3-step cold email cadences generated by GPT-4.' },
+      { id: 'A-03', name: 'Instagram DM Bot',      desc: 'Converts story replies & DM enquiries into qualified leads automatically.' },
+      { id: 'A-04', name: 'Referral Engine',       desc: 'Auto-triggers referral invites post-purchase and tracks conversions.' },
+    ],
+  },
+  {
+    id: 'convert', label: 'Convert', cls: 'cat-convert',
+    workflows: [
+      { id: 'C-01', name: 'Cart Recovery',         desc: '3-wave email + WhatsApp sequence recovers abandoned carts in 24h.' },
+      { id: 'C-02', name: 'Inventory Drop Alert',  desc: 'Back-in-stock and low-stock alerts pushed via email and WhatsApp.' },
+      { id: 'C-03', name: 'Dynamic Pricing',       desc: 'Adjusts prices based on demand signals and competitor data.' },
+      { id: 'C-04', name: 'Gamified Checkout',     desc: 'Adds progress bars and milestone rewards to boost AOV at checkout.' },
+    ],
+  },
+  {
+    id: 'intel', label: 'Intelligence', cls: 'cat-intel',
+    workflows: [
+      { id: 'I-01', name: 'Trend Spotter',         desc: 'Monitors TikTok, Google Trends and social for viral product signals.' },
+      { id: 'I-02', name: 'Competitor Radar',      desc: 'Weekly competitor pricing and content intelligence digest.' },
+      { id: 'I-03', name: 'Customer Intel',        desc: 'Enriches customer profiles with psychographics and CLV predictions.' },
+      { id: 'I-04', name: 'Review Analyser',       desc: 'NLP sentiment analysis on reviews → product improvement insights.' },
+    ],
+  },
+  {
+    id: 'retain', label: 'Retain', cls: 'cat-retain',
+    workflows: [
+      { id: 'R-01', name: 'CRM Follow-up',         desc: 'Post-purchase sequences: thank-you, how-to, upsell and review ask.' },
+      { id: 'R-02', name: 'Loyalty Engine',        desc: 'Points, tiers, birthday rewards and VIP perks for repeat buyers.' },
+      { id: 'R-03', name: 'Win-back Campaign',     desc: '3-stage re-engagement with escalating incentives for lapsed customers.' },
+      { id: 'R-04', name: 'Churn Predictor',       desc: 'Flags at-risk customers 30 days before likely churn for intervention.' },
+    ],
+  },
+  {
+    id: 'support', label: 'Support', cls: 'cat-support',
+    workflows: [
+      { id: 'S-01', name: 'WhatsApp Support Bot',  desc: 'AI answers order, delivery and product queries via WhatsApp 24/7.' },
+      { id: 'S-02', name: 'RAG Brain',             desc: 'GPT-4 answers product queries from your indexed knowledge base.' },
+      { id: 'S-03', name: 'Review Responder',      desc: 'Auto-drafts personalised responses to Google and Trustpilot reviews.' },
+      { id: 'S-04', name: 'CEO Assistant',         desc: 'Critical alerts escalated directly to CEO via WhatsApp with context.' },
+    ],
+  },
+  {
+    id: 'scale', label: 'Scale', cls: 'cat-scale',
+    workflows: [
+      { id: 'SC-01', name: 'UGC Harvester',        desc: 'Identifies top UGC creators and automates outreach + brief delivery.' },
+      { id: 'SC-02', name: 'Amazon Expansion',     desc: 'Cross-lists Shopify products on Amazon with AI-optimised listings.' },
+      { id: 'SC-03', name: 'Sales Automation',     desc: 'Detects buying signals and triggers personalised B2B outreach.' },
+      { id: 'SC-04', name: 'SEO Meta Writer',      desc: 'Generates SEO-optimised product titles, descriptions and meta tags.' },
+    ],
+  },
 ];
 
-// ── Utilities ──────────────────────────────────────
-function esc(str) {
-  if (str == null) return '';
-  return String(str)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#039;');
-}
-
-function timeAgo(iso) {
-  if (!iso) return 'Never';
-  const diff  = Date.now() - new Date(iso).getTime();
-  const mins  = Math.floor(diff / 60000);
-  const hours = Math.floor(diff / 3600000);
-  const days  = Math.floor(diff / 86400000);
-  if (mins < 1)   return 'Just now';
-  if (mins < 60)  return mins + 'm ago';
-  if (hours < 24) return hours + 'h ago';
-  if (days < 7)   return days + 'd ago';
-  return new Date(iso).toLocaleDateString();
-}
-
-function fmtNum(n) {
-  if (n == null || isNaN(n)) return '0';
-  if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
-  if (n >= 1000)    return (n / 1000).toFixed(1) + 'K';
-  return String(Math.round(n));
-}
-
-function fmtCurrency(n) {
-  if (n == null || isNaN(n)) return '$0';
-  return '$' + Number(n).toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 0 });
-}
-
-function hexAlpha(hex, alpha) {
-  const r = parseInt(hex.slice(1, 3), 16);
-  const g = parseInt(hex.slice(3, 5), 16);
-  const b = parseInt(hex.slice(5, 7), 16);
-  return 'rgba(' + r + ',' + g + ',' + b + ',' + alpha + ')';
-}
-
-function getGreeting() {
-  const h = new Date().getHours();
-  if (h < 12) return 'morning';
-  if (h < 17) return 'afternoon';
-  return 'evening';
-}
-
-// ── Mock Data ──────────────────────────────────────
-const MOCK_DATA = {
+// ── Mock data for demo mode ────────────────────────
+const MOCK = {
   config: {
-    brand_name: 'Lumino Skin',
-    tenants: { name: 'Lumino Skin', plan: 'Scale' },
-    feature_loyalty: true,
-    feature_gamification: true,
-    feature_rag: true,
-    feature_amazon: false,
-    feature_ugc: true,
-    feature_tax_reports: true,
-    brand_logo: null,
-    store_url: 'https://luminoskin.com'
+    brand_name: 'Luna Cosmetics',
+    plan: 'scale',
+    slug: 'luna-cosmetics',
+    store_url: 'https://luna.myshopify.com',
+    brand_voice: 'Warm, expert, inspiring',
+    strategy_email: 'strategy@luna.com',
+    ops_email: 'ops@luna.com',
   },
-  workflows: [
-    { workflow_id: 'A-01', is_active: true, run_count: 1242, error_count: 0, last_run_at: new Date(Date.now() - 1000 * 60 * 15).toISOString() },
-    { workflow_id: 'A-02', is_active: true, run_count: 8500, error_count: 12, last_run_at: new Date(Date.now() - 1000 * 60 * 60 * 2).toISOString() },
-    { workflow_id: 'C-01', is_active: true, run_count: 450, error_count: 2, last_run_at: new Date(Date.now() - 1000 * 60 * 30).toISOString() },
-    { workflow_id: 'C-04', is_active: true, run_count: 2100, error_count: 0, last_run_at: new Date(Date.now() - 1000 * 60 * 5).toISOString() },
-    { workflow_id: 'I-02', is_active: true, run_count: 31, error_count: 0, last_run_at: new Date(Date.now() - 1000 * 60 * 60 * 24).toISOString() },
-    { workflow_id: 'R-02', is_active: true, run_count: 125, error_count: 0, last_run_at: new Date(Date.now() - 1000 * 60 * 60 * 6).toISOString() },
-    { workflow_id: 'S-02', is_active: true, run_count: 340, error_count: 5, last_run_at: new Date(Date.now() - 1000 * 60 * 20).toISOString() },
-    { workflow_id: 'SC-01', is_active: false, run_count: 0, error_count: 0, last_run_at: null },
-  ],
+  workflows: CATEGORIES.flatMap((cat, ci) =>
+    cat.workflows.map((wf, wi) => ({
+      workflow_id: wf.id,
+      is_active: Math.random() > 0.2,
+      run_count: Math.floor(Math.random() * 4000) + 200,
+      error_count: Math.floor(Math.random() * 8),
+      last_run_at: new Date(Date.now() - Math.random() * 3600000).toISOString(),
+    }))
+  ),
   analytics: {
-    leads: Array.from({ length: 15 }, (_, i) => ({
-      id: i,
-      email: `user${i}@gmail.com`,
-      score: 70 + Math.floor(Math.random() * 25),
-      created_at: new Date(Date.now() - i * 1000 * 60 * 60 * 4).toISOString()
+    leads: Array.from({ length: 120 }, (_, i) => ({
+      score: Math.floor(Math.random() * 100),
+      category: ['hot','warm','cold'][Math.floor(Math.random()*3)],
+      created_at: new Date(Date.now() - Math.random() * 30 * 86400000).toISOString(),
     })),
-    carts: [
-      { id: 1, email: 'sarah@example.com', value: 120, status: 'recovered', created_at: new Date(Date.now() - 1000 * 60 * 120).toISOString() },
-      { id: 2, email: 'mike@test.io', value: 85, status: 'pending', created_at: new Date(Date.now() - 1000 * 60 * 45).toISOString() },
-      { id: 3, email: 'jason@gmail.com', value: 240, status: 'recovered', created_at: new Date(Date.now() - 1000 * 60 * 60 * 5).toISOString() },
-      { id: 4, email: 'anna@outlook.com', value: 45, status: 'lost', created_at: new Date(Date.now() - 1000 * 60 * 60 * 24).toISOString() },
-    ]
+    carts: Array.from({ length: 80 }, () => ({
+      status: Math.random() > 0.4 ? 'recovered' : 'abandoned',
+      cart_value: +(Math.random() * 180 + 20).toFixed(2),
+      recovery_value: +(Math.random() * 150 + 15).toFixed(2),
+      created_at: new Date(Date.now() - Math.random() * 30 * 86400000).toISOString(),
+    })),
+    loyalty: Array.from({ length: 300 }, () => ({
+      points: Math.floor(Math.random() * 500) + 50,
+      event_type: ['purchase','referral','review'][Math.floor(Math.random()*3)],
+    })),
+    tickets: Array.from({ length: 45 }, () => ({
+      status: Math.random() > 0.3 ? 'closed' : 'open',
+    })),
+    winback: [],
+    workflows: [],
   },
+  attribution: [
+    { workflow_id: 'C-01', total: 18240, count: 47 },
+    { workflow_id: 'R-02', total: 12680, count: 83 },
+    { workflow_id: 'A-01', total: 9450, count: 31 },
+    { workflow_id: 'R-01', total: 7120, count: 62 },
+    { workflow_id: 'SC-03', total: 5870, count: 19 },
+    { workflow_id: 'C-02', total: 3210, count: 28 },
+  ],
+  emailStats: {
+    summary: { sent: 4820, delivered: 4750, opened: 1995, clicked: 618, replied: 89, open_rate: 42.0, click_rate: 13.0, reply_rate: 1.9 },
+    by_workflow: [
+      { workflow_id: 'C-01', sent: 1240, opened: 558, clicked: 186, open_rate: 45.0 },
+      { workflow_id: 'R-01', sent: 980,  opened: 421, clicked: 98,  open_rate: 43.0 },
+      { workflow_id: 'A-02', sent: 640,  opened: 224, clicked: 64,  open_rate: 35.0 },
+    ],
+  },
+  cohorts: [
+    { cohort: '2025-10', size: 143, retention: [68, 41, 29, 22, 18] },
+    { cohort: '2025-11', size: 167, retention: [72, 44, 31, 24] },
+    { cohort: '2025-12', size: 198, retention: [69, 40, 27] },
+    { cohort: '2026-01', size: 221, retention: [75, 46] },
+    { cohort: '2026-02', size: 189, retention: [71] },
+    { cohort: '2026-03', size: 234, retention: [] },
+  ],
+  logs: Array.from({ length: 30 }, (_, i) => {
+    const wfIds = ['A-01','C-01','R-01','R-02','S-01','SC-04','I-03','A-02','C-02'];
+    const wf = wfIds[i % wfIds.length];
+    const ok = Math.random() > 0.08;
+    return {
+      id: `log-${i}`,
+      workflow_id: wf,
+      status: ok ? 'completed' : 'failed',
+      duration_ms: Math.floor(Math.random() * 4000) + 200,
+      input_summary: `Demo input for ${wf}`,
+      output_summary: ok ? `Processed successfully` : null,
+      error_message: ok ? null : 'OpenAI timeout',
+      executed_at: new Date(Date.now() - i * 4 * 60000).toISOString(),
+    };
+  }),
+  content: [
+    { id: '1', title: 'Spring Skincare Guide 2026', type: 'blog', platform: 'Website', status: 'published', keyword: 'spring skincare', published_at: '2026-03-01T10:00:00Z' },
+    { id: '2', title: '5 Reasons to Switch to Natural Serums', type: 'email', platform: 'Brevo', status: 'scheduled', keyword: 'natural serum', scheduled_at: '2026-04-05T09:00:00Z' },
+    { id: '3', title: 'Vitamin C Routine — TikTok Script', type: 'social', platform: 'TikTok', status: 'draft', keyword: 'vitamin c routine' },
+    { id: '4', title: 'New Retinol Launch Campaign', type: 'email', platform: 'Brevo', status: 'draft', keyword: 'retinol launch' },
+    { id: '5', title: 'Customer Love Story — Emma', type: 'ugc', platform: 'Instagram', status: 'published', published_at: '2026-03-15T14:00:00Z' },
+  ],
+  abTests: [
+    { id: '1', workflow_id: 'C-01', name: 'Cart Recovery Subject Lines', status: 'running', variant_a: 'You left something behind 🛒', variant_b: 'Your cart misses you — 10% off inside', a_sent: 480, a_opened: 211, b_sent: 480, b_opened: 254, winner: null },
+    { id: '2', workflow_id: 'A-02', name: 'Cold Outreach CTA Copy', status: 'completed', variant_a: 'Book a 15-min call', variant_b: 'See how it works →', a_sent: 320, a_opened: 108, b_sent: 320, b_opened: 144, winner: 'B' },
+    { id: '3', workflow_id: 'R-01', name: 'Post-purchase Timing', status: 'running', variant_a: 'Send at 1h after order', variant_b: 'Send at 24h after order', a_sent: 290, a_opened: 148, b_sent: 290, b_opened: 127, winner: null },
+  ],
+  ragDocs: [
+    { id: '1', name: 'Product Handbook 2026.pdf', size_bytes: 2400000, status: 'indexed', chunk_count: 680, uploaded_at: '2026-02-10T12:00:00Z' },
+    { id: '2', name: 'FAQ — Shipping & Returns.docx', size_bytes: 480000, status: 'indexed', chunk_count: 137, uploaded_at: '2026-02-28T09:30:00Z' },
+    { id: '3', name: 'Ingredient Glossary.pdf', size_bytes: 1100000, status: 'indexed', chunk_count: 314, uploaded_at: '2026-03-12T14:00:00Z' },
+  ],
   integrations: [
-    { id: 'openai', connected: true, env_var: 'OPENAI_API_KEY', workflows: ['A-02', 'A-04', 'C-03', 'S-01', 'S-02'] },
-    { id: 'shopify', connected: true, env_var: 'SHOPIFY_ACCESS_TOKEN', workflows: ['C-01', 'C-02', 'R-02'] },
-    { id: 'supabase', connected: true, env_var: 'SUPABASE_URL', workflows: ['A-01', 'I-03'] },
-    { id: 'brevo', connected: true, env_var: 'BREVO_API_KEY', workflows: ['A-02', 'C-01', 'R-01', 'R-04'] },
-    { id: 'pinecone', connected: true, env_var: 'PINECONE_API_KEY', workflows: ['S-02'] },
-    { id: 'slack', connected: false, env_var: 'SLACK_BOT_TOKEN', workflows: ['S-03'] },
-  ]
+    { key: 'openai',    label: 'OpenAI',          connected: true,  env_var: 'OPENAI_API_KEY',        workflows: ['All 24 workflows'] },
+    { key: 'supabase',  label: 'Supabase',         connected: true,  env_var: 'SUPABASE_URL',          workflows: ['All 24 workflows'] },
+    { key: 'shopify',   label: 'Shopify',          connected: true,  env_var: 'SHOPIFY_ACCESS_TOKEN',  workflows: ['C-01','C-02','C-04','R-01','SC-04'] },
+    { key: 'brevo',     label: 'Brevo (Email)',    connected: true,  env_var: 'BREVO_API_KEY',         workflows: ['A-02','C-01','R-01','R-02'] },
+    { key: 'slack',     label: 'Slack',            connected: true,  env_var: 'SLACK_BOT_TOKEN',       workflows: ['All 24 workflows'] },
+    { key: 'whatsapp',  label: 'WhatsApp',         connected: false, env_var: 'WHATSAPP_ACCESS_TOKEN', workflows: ['A-03','S-01','S-04'] },
+    { key: 'instagram', label: 'Instagram',        connected: false, env_var: 'INSTAGRAM_ACCESS_TOKEN',workflows: ['A-03','SC-01'] },
+    { key: 'pinecone',  label: 'Pinecone (RAG)',   connected: true,  env_var: 'PINECONE_API_KEY',      workflows: ['S-02'] },
+    { key: 'google',    label: 'Google Ads',       connected: false, env_var: 'GOOGLE_SERVICE_ACCOUNT',workflows: ['I-02','I-04'] },
+  ],
 };
 
-async function mockApi(path, opts) {
-  await new Promise(r => setTimeout(r, 300));
-  var method = opts && opts.method ? opts.method.toUpperCase() : 'GET';
-
-  // Trigger endpoint — simulate a successful run
-  if (path.includes('/trigger') && method === 'POST') {
-    return { success: true, workflow_id: path.split('/').slice(-2, -1)[0], result: { status: 'ok', demo: true } };
-  }
-  // Workflow PATCH (toggle / save overrides)
-  if (path.includes('/workflows/') && method === 'PATCH') {
-    return { success: true };
-  }
-  // Default-payload endpoint
-  if (path.includes('/default-payload')) return {};
-  // Cascades map
-  if (path.includes('/cascades')) {
-    var out = {};
-    Object.keys(CASCADE_DISPLAY).forEach(function (k) { out[k] = CASCADE_DISPLAY[k].map(function (c) { return { triggers: c.to, label: c.label }; }); });
-    return out;
-  }
-
-  if (path.includes('/api/config/')) return MOCK_DATA.config;
-  if (path.includes('/workflows'))   return MOCK_DATA.workflows;
-  if (path.includes('/analytics'))   return MOCK_DATA.analytics;
-  if (path.includes('/integrations'))return MOCK_DATA.integrations;
-  if (method === 'PATCH' || method === 'PUT') return { success: true };
-  return {};
-}
-
-// ── API ────────────────────────────────────────────
-async function api(path, opts) {
-  if (state.demo) return mockApi(path, opts);
-  opts = opts || {};
-  const headers = { 'Content-Type': 'application/json' };
-  if (state.key) headers['x-api-key'] = state.key;
-  const res = await fetch(path, Object.assign({}, opts, { headers: Object.assign({}, headers, opts.headers || {}) }));
-  if (!res.ok) {
-    let errMsg = 'HTTP ' + res.status;
-    try { const j = await res.json(); errMsg = j.error || errMsg; } catch (_) {}
-    throw new Error(errMsg);
-  }
-  return res.json();
-}
-
-// ── Toast ──────────────────────────────────────────
-function toast(msg, type) {
-  type = type || 'success';
-  const container = document.getElementById('toast-container');
-  const el = document.createElement('div');
-  el.className = 'toast toast-' + type;
-
-  const iconSvg = type === 'success'
-    ? '<svg class="toast-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>'
-    : '<svg class="toast-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>';
-
-  el.innerHTML = iconSvg + '<span>' + esc(msg) + '</span>';
-  container.appendChild(el);
-
-  const dismiss = function () {
-    el.classList.add('hiding');
-    setTimeout(function () { el.remove(); }, 260);
+// ── API helper ────────────────────────────────────
+async function api(method, path, body) {
+  if (state.demo) return mockApi(method, path, body);
+  const opts = {
+    method,
+    headers: { 'x-api-key': state.key, 'Content-Type': 'application/json' },
   };
-
-  const timer = setTimeout(dismiss, 3000);
-  el.addEventListener('click', function () { clearTimeout(timer); dismiss(); });
+  if (body) opts.body = JSON.stringify(body);
+  const r = await fetch(path, opts);
+  if (!r.ok) {
+    const err = await r.json().catch(() => ({ error: r.statusText }));
+    throw new Error(err.error || r.statusText);
+  }
+  return r.json();
 }
 
-// ── Screen navigation ──────────────────────────────
+function mockApi(method, path, body) {
+  return new Promise(resolve => setTimeout(() => {
+    if (path.includes('/config/'))          return resolve(MOCK.config);
+    if (path.includes('/workflows') && method === 'GET') return resolve(MOCK.workflows);
+    if (path.includes('/analytics'))        return resolve(MOCK.analytics);
+    if (path.includes('/attribution'))      return resolve(MOCK.attribution);
+    if (path.includes('/email-stats'))      return resolve(MOCK.emailStats);
+    if (path.includes('/cohorts'))          return resolve(MOCK.cohorts);
+    if (path.includes('/logs'))             return resolve(MOCK.logs);
+    if (path.includes('/content'))         return resolve(MOCK.content);
+    if (path.includes('/ab-tests'))        return resolve(MOCK.abTests);
+    if (path.includes('/rag-docs'))        return resolve(MOCK.ragDocs);
+    if (path.includes('/integrations'))    return resolve(MOCK.integrations);
+    if (method === 'PATCH' || method === 'PUT') return resolve({ ...(body || {}), updated: true });
+    if (method === 'POST')  return resolve({ id: 'demo-' + Date.now(), ...(body || {}), created: true });
+    if (method === 'DELETE') return resolve({ deleted: true });
+    resolve({});
+  }, 180));
+}
+
+// ── Toast ─────────────────────────────────────────
+function toast(msg, type = 'info') {
+  const el = document.createElement('div');
+  el.className = `toast ${type}`;
+  el.textContent = msg;
+  document.getElementById('toast-container').appendChild(el);
+  setTimeout(() => el.remove(), 3500);
+}
+
+// ── Modal ─────────────────────────────────────────
+function openModal(title, bodyHtml, footerHtml = '') {
+  document.getElementById('modal-title').textContent = title;
+  document.getElementById('modal-body').innerHTML = bodyHtml;
+  const modal = document.getElementById('modal');
+  // Remove old footer if any
+  const oldFtr = modal.querySelector('.modal-footer');
+  if (oldFtr) oldFtr.remove();
+  if (footerHtml) {
+    const ftr = document.createElement('div');
+    ftr.className = 'modal-footer';
+    ftr.innerHTML = footerHtml;
+    modal.querySelector('.modal-box').appendChild(ftr);
+  }
+  modal.style.display = 'flex';
+}
+function closeModal() { document.getElementById('modal').style.display = 'none'; }
+
+// ── Screen switching ──────────────────────────────
 function showScreen(id) {
-  document.querySelectorAll('.screen').forEach(function (s) {
-    s.classList.toggle('hidden', s.id !== id);
-  });
+  document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
+  document.getElementById(id).classList.add('active');
 }
 
-// ── App navigation ─────────────────────────────────
-let currentView = 'overview';
-
-async function go(view) {
-  currentView = view;
-  document.querySelectorAll('.nav-item').forEach(function (btn) {
-    btn.classList.toggle('active', btn.dataset.view === view);
-  });
-  const mc = document.getElementById('main-content');
-  mc.innerHTML = renderSkeleton(view);
-
-  try {
-    let html = '';
-    if (view === 'overview')      html = await viewOverview();
-    else if (view === 'workflows')    html = await viewWorkflows();
-    else if (view === 'analytics')    html = await viewAnalytics();
-    else if (view === 'integrations') html = await viewIntegrations();
-    else if (view === 'settings')     html = await viewSettings();
-    mc.innerHTML = html;
-    attachViewListeners(view, mc);
-  } catch (err) {
-    mc.innerHTML = '<div class="empty-state" style="padding-top:3rem">'
-      + '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="40" height="40"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>'
-      + '<p>Failed to load: ' + esc(err.message) + '</p></div>';
-  }
-}
-
-function renderSkeleton(view) {
-  var card = function (h) { return '<div class="skeleton" style="height:' + h + 'px;border-radius:0.75rem"></div>'; };
-  if (view === 'overview') {
-    return '<div class="view-header"><div class="skeleton" style="width:220px;height:28px;border-radius:6px"></div></div>'
-      + '<div class="stat-grid" style="margin-bottom:2rem">' + [card(90), card(90), card(90), card(90)].join('') + '</div>'
-      + '<div class="category-grid">' + [card(80), card(80), card(80), card(80), card(80), card(80)].join('') + '</div>';
-  }
-  if (view === 'workflows') {
-    return CATEGORIES.map(function () {
-      return '<div style="margin-bottom:2rem"><div class="skeleton" style="width:160px;height:20px;margin-bottom:1rem;border-radius:6px"></div>'
-        + '<div class="wf-grid">' + [card(110), card(110), card(110), card(110)].join('') + '</div></div>';
-    }).join('');
-  }
-  if (view === 'analytics') {
-    return '<div class="analytics-metrics" style="margin-bottom:2rem">' + [card(90), card(90), card(90), card(90), card(90)].join('') + '</div>'
-      + '<div class="analytics-tables">' + [card(240), card(240)].join('') + '</div>';
-  }
-  if (view === 'integrations') {
-    return '<div class="integrations-grid">' + [card(150), card(150), card(150), card(150), card(150), card(150), card(150), card(150), card(150)].join('') + '</div>';
-  }
-  return '<div style="display:flex;flex-direction:column;gap:1rem">' + [card(100), card(100), card(100), card(100)].join('') + '</div>';
-}
-
-// ── Connect / Disconnect ───────────────────────────
+// ── Connect ───────────────────────────────────────
 async function connect(slug, key) {
-  state.demo   = false;
-  state.slug   = slug;
-  state.key    = key;
-  state.cache  = {};
-  document.getElementById('demo-badge').classList.add('hidden');
-  const config = await api('/api/config/' + encodeURIComponent(slug));
+  state.slug = slug;
+  state.key  = key;
+  const config = await api('GET', `/api/config/${slug}`);
   state.config = config;
-
-  const brandName = config.brand_name || (config.tenants && config.tenants.name) || slug;
-  document.getElementById('tenant-name').textContent = brandName;
-  document.getElementById('tenant-avatar').textContent = brandName.charAt(0).toUpperCase();
-
-  const plan = ((config.tenants && config.tenants.plan) || 'growth').toLowerCase();
-  const pp = document.getElementById('tenant-plan-pill');
-  pp.textContent = plan;
-  pp.className = 'plan-pill plan-' + plan;
-
-  showScreen('screen-app');
-  connectOrchestratorFeed();
-  go('overview');
+  enterApp();
 }
 
-async function connectDemo() {
-  state.demo = true;
-  state.slug = 'demo-workspace';
-  state.key  = 'demo-key';
-  state.cache = {};
-  document.getElementById('demo-badge').classList.remove('hidden');
-  
-  const config = await api('/api/config/demo-workspace');
-  state.config = config;
-  
-  document.getElementById('tenant-name').textContent = config.brand_name;
-  document.getElementById('tenant-avatar').textContent = config.brand_name.charAt(0).toUpperCase();
-  
-  const plan = config.tenants.plan.toLowerCase();
-  const pp = document.getElementById('tenant-plan-pill');
-  pp.textContent = plan;
-  pp.className = 'plan-pill plan-' + plan;
-  
-  showScreen('screen-app');
-  // demo mode: no real SSE
-  go('overview');
+function connectDemo() {
+  state.demo   = true;
+  state.slug   = 'luna-cosmetics';
+  state.config = MOCK.config;
+  enterApp();
 }
 
-function disconnect() {
-  if (sseSource) { sseSource.close(); sseSource = null; }
-  cascadeLog = [];
-  cascadeLogListeners = [];
-  state.slug   = null;
-  state.key    = null;
-  state.config = null;
-  state.cache  = {};
-  state.demo   = false;
-  document.getElementById('demo-badge').classList.add('hidden');
+function enterApp() {
+  // Sidebar tenant info
+  const cfg = state.config;
+  const planCls = { growth: 'pill-growth', scale: 'pill-scale', enterprise: 'pill-enterprise' }[cfg.plan] || 'pill-info';
+  document.getElementById('sidebar-tenant').innerHTML = `
+    <strong>${cfg.brand_name || cfg.slug}</strong>
+    <span class="pill ${planCls}">${(cfg.plan || 'growth').toUpperCase()}</span>
+  `;
+  if (state.demo) {
+    document.getElementById('demo-mode-badge').style.display = 'block';
+  }
+  showScreen('screen-app');
+  navTo('overview');
+  if (state.demo) startDemoFeed();
+  else connectSSE();
+}
+
+function signOut() {
+  if (state.sseSource) { state.sseSource.close(); state.sseSource = null; }
+  if (state.demoFeedTimer) { clearInterval(state.demoFeedTimer); state.demoFeedTimer = null; }
+  state.slug = null; state.key = null; state.demo = false; state.config = null; state.cache = {};
+  state.feedItems = [];
   showScreen('screen-connect');
-  document.getElementById('inp-slug').value = '';
-  document.getElementById('inp-key').value  = '';
-  document.getElementById('connect-error').classList.add('hidden');
 }
 
-// ── Cached fetches ─────────────────────────────────
-async function fetchWorkflows() {
-  if (state.cache.workflows) return state.cache.workflows;
-  const data = await api('/api/tenants/' + encodeURIComponent(state.slug) + '/workflows');
-  state.cache.workflows = data;
-  return data;
-}
-
-async function fetchAnalytics() {
-  if (state.cache.analytics) return state.cache.analytics;
-  const data = await api('/api/tenants/' + encodeURIComponent(state.slug) + '/analytics');
-  state.cache.analytics = data;
-  return data;
-}
-
-async function fetchIntegrations() {
-  if (state.cache.integrations) return state.cache.integrations;
-  const data = await api('/api/tenants/' + encodeURIComponent(state.slug) + '/integrations');
-  state.cache.integrations = data;
-  return data;
-}
-
-// ── View: Overview ─────────────────────────────────
-async function viewOverview() {
-  var results = await Promise.all([fetchWorkflows(), fetchAnalytics()]);
-  var wfStates = results[0] || [];
-  var analytics = results[1] || {};
-
-  var wfMap = {};
-  wfStates.forEach(function (w) { wfMap[w.workflow_id] = w; });
-
-  var activeCount = wfStates.filter(function (w) { return w.is_active; }).length;
-  var totalRuns   = wfStates.reduce(function (s, w) { return s + (w.run_count || 0); }, 0);
-
-  var now = new Date();
-  var leadsThisMonth = (analytics.leads || []).filter(function (l) {
-    var d = new Date(l.created_at);
-    return d.getMonth() === now.getMonth() && d.getFullYear() === now.getFullYear();
-  }).length;
-
-  var cartsRecovered = (analytics.carts || []).filter(function (c) { return c.status === 'recovered'; }).length;
-
-  var brandName = esc(state.config && state.config.brand_name
-    ? state.config.brand_name
-    : (state.config && state.config.tenants && state.config.tenants.name
-        ? state.config.tenants.name
-        : state.slug));
-
-  var catCards = CATEGORIES.map(function (cat, i) {
-    var active = cat.workflows.filter(function (wf) { return wfMap[wf.id] && wfMap[wf.id].is_active; }).length;
-    var total  = cat.workflows.length;
-    var pct    = Math.round((active / total) * 100);
-    return '<div class="cat-health-card" style="animation-delay:' + (i * 40) + 'ms">'
-      + '<div class="cat-health-header">'
-      + '<span class="cat-health-name">' + esc(cat.label) + '</span>'
-      + '<span style="font-size:0.75rem;font-weight:600;color:' + esc(cat.color) + '">' + active + '/' + total + '</span>'
-      + '</div>'
-      + '<div class="cat-health-bar-wrap"><div class="cat-health-bar" style="width:' + pct + '%;background:' + esc(cat.color) + '"></div></div>'
-      + '<div class="cat-health-count">' + active + ' active workflow' + (active !== 1 ? 's' : '') + '</div>'
-      + '</div>';
-  }).join('');
-
-  return '<div class="view-header">'
-    + '<div class="view-greeting">Good ' + getGreeting() + ', ' + brandName + '</div>'
-    + '<div class="view-sub">Here\'s your AI workflow dashboard</div>'
-    + '</div>'
-    + '<div class="stat-grid">'
-    + '<div class="stat-card"><div class="stat-label">Active Workflows</div><div class="stat-value">' + fmtNum(activeCount) + '</div><div class="stat-change">of ' + (CATEGORIES.length * 4) + ' total</div></div>'
-    + '<div class="stat-card"><div class="stat-label">Leads This Month</div><div class="stat-value">' + fmtNum(leadsThisMonth) + '</div><div class="stat-change">captured &amp; scored</div></div>'
-    + '<div class="stat-card"><div class="stat-label">Carts Recovered</div><div class="stat-value">' + fmtNum(cartsRecovered) + '</div><div class="stat-change">all-time recoveries</div></div>'
-    + '<div class="stat-card"><div class="stat-label">Total Runs</div><div class="stat-value">' + fmtNum(totalRuns) + '</div><div class="stat-change">across all workflows</div></div>'
-    + '</div>'
-    + '<div class="section-title">Category Health</div>'
-    + '<div class="category-grid">' + catCards + '</div>';
-}
-
-// ── View: Workflows ────────────────────────────────
-async function viewWorkflows() {
-  var wfStates = await fetchWorkflows();
-  var wfMap = {};
-  (wfStates || []).forEach(function (w) { wfMap[w.workflow_id] = w; });
-
-  var sections = CATEGORIES.map(function (cat, ci) {
-    var activeInCat = cat.workflows.filter(function (wf) { return wfMap[wf.id] && wfMap[wf.id].is_active; }).length;
-
-    var cards = cat.workflows.map(function (wf) {
-      var sd       = wfMap[wf.id] || {};
-      var isActive = !!sd.is_active;
-      var runCount = sd.run_count   || 0;
-      var errCount = sd.error_count || 0;
-      var lastRun  = timeAgo(sd.last_run_at);
-
-      // Cascade arrows: outgoing + incoming
-      var outgoing = (CASCADE_DISPLAY[wf.id] || []).map(function (c) {
-        return '<span class="cascade-badge out" title="Triggers ' + esc(c.to) + ': ' + esc(c.label) + '">→ ' + esc(c.to) + '</span>';
-      }).join('');
-      var incoming = (CASCADE_RECEIVES[wf.id] || []).map(function (c) {
-        return '<span class="cascade-badge in" title="Triggered by ' + esc(c.from) + ': ' + esc(c.label) + '">← ' + esc(c.from) + '</span>';
-      }).join('');
-      var cascadeBadges = (outgoing || incoming)
-        ? '<div class="wf-cascades">' + outgoing + incoming + '</div>'
-        : '';
-
-      return '<div class="wf-card" data-wf-id="' + esc(wf.id) + '">'
-        + '<div class="wf-card-top">'
-        + '<div class="wf-card-info">'
-        + '<div class="wf-id-badge" style="background:' + hexAlpha(cat.color, 0.15) + ';color:' + esc(cat.color) + '">' + esc(wf.id) + '</div>'
-        + '<div class="wf-name">' + esc(wf.name) + '</div>'
-        + '<div class="wf-desc">' + esc(wf.desc) + '</div>'
-        + '</div>'
-        + '<label class="toggle-wrap" title="' + (isActive ? 'Disable' : 'Enable') + ' workflow">'
-        + '<input type="checkbox" class="toggle-input" data-wf-id="' + esc(wf.id) + '" ' + (isActive ? 'checked' : '') + ' />'
-        + '<span class="toggle-track"></span>'
-        + '</label>'
-        + '</div>'
-        + cascadeBadges
-        + '<div class="wf-stats">'
-        + '<div class="wf-stat"><span class="wf-stat-val">' + fmtNum(runCount) + '</span><span class="wf-stat-label">Runs</span></div>'
-        + '<div class="wf-stat"><span class="wf-stat-val' + (errCount > 0 ? ' error-val' : '') + '">' + fmtNum(errCount) + '</span><span class="wf-stat-label">Errors</span></div>'
-        + '<div class="wf-stat"><span class="wf-stat-val last-run">' + esc(lastRun) + '</span><span class="wf-stat-label">Last run</span></div>'
-        + '</div>'
-        + '<div class="wf-card-actions">'
-        + '<button class="btn btn-ghost btn-xs wf-configure-btn" data-wf-id="' + esc(wf.id) + '" data-cat-color="' + esc(cat.color) + '">Configure</button>'
-        + '<button class="btn btn-primary btn-xs wf-trigger-btn" data-wf-id="' + esc(wf.id) + '" title="Manually run this workflow">Run now</button>'
-        + '</div>'
-        + '</div>';
-    }).join('');
-
-    return '<div class="category-section" style="animation-delay:' + (ci * 50) + 'ms">'
-      + '<div class="category-header" style="border-left-color:' + esc(cat.color) + '">'
-      + '<span class="category-header-text">' + esc(cat.label) + '</span>'
-      + '<span class="category-header-count">' + activeInCat + '/' + cat.workflows.length + ' active</span>'
-      + '</div>'
-      + '<div class="wf-grid">' + cards + '</div>'
-      + '</div>';
-  }).join('');
-
-  return sections;
-}
-
-// ── View: Analytics ────────────────────────────────
-async function viewAnalytics() {
-  var data = await fetchAnalytics();
-  var leads   = data.leads   || [];
-  var carts   = data.carts   || [];
-  var loyalty = data.loyalty || [];
-
-  var totalLeads  = leads.length;
-  var hotLeads    = leads.filter(function (l) { return (l.score || 0) >= 70; }).length;
-  var recovered   = carts.filter(function (c) { return c.status === 'recovered'; });
-  var cartsCount  = recovered.length;
-  var recoveryVal = recovered.reduce(function (s, c) { return s + (c.recovery_value || 0); }, 0);
-  var loyaltyPts  = loyalty.reduce(function (s, l) { return s + (l.points || 0); }, 0);
-
-  var metrics = [
-    { label: 'Total Leads',     value: fmtNum(totalLeads),   color: '#38bdf8', bg: 'rgba(56,189,248,0.12)',
-      icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>' },
-    { label: 'Hot Leads',       value: fmtNum(hotLeads),     color: '#ef4444', bg: 'rgba(239,68,68,0.12)',
-      icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>' },
-    { label: 'Carts Recovered', value: fmtNum(cartsCount),   color: '#34d399', bg: 'rgba(52,211,153,0.12)',
-      icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16"><circle cx="9" cy="21" r="1"/><circle cx="20" cy="21" r="1"/><path d="M1 1h4l2.68 13.39a2 2 0 0 0 2 1.61h9.72a2 2 0 0 0 2-1.61L23 6H6"/></svg>' },
-    { label: 'Recovery Value',  value: fmtCurrency(recoveryVal), color: '#fbbf24', bg: 'rgba(251,191,36,0.12)',
-      icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16"><line x1="12" y1="1" x2="12" y2="23"/><path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg>' },
-    { label: 'Loyalty Points',  value: fmtNum(loyaltyPts),   color: '#fb923c', bg: 'rgba(251,146,60,0.12)',
-      icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/></svg>' },
-  ];
-
-  var metricCards = metrics.map(function (m) {
-    return '<div class="metric-card">'
-      + '<div class="metric-icon" style="background:' + m.bg + ';color:' + m.color + '">' + m.icon + '</div>'
-      + '<div class="metric-label">' + esc(m.label) + '</div>'
-      + '<div class="metric-value">' + esc(m.value) + '</div>'
-      + '</div>';
-  }).join('');
-
-  // Cart table (last 8 newest first)
-  var cartRows = carts.slice(-8).reverse();
-  var cartHtml = cartRows.length ? cartRows.map(function (c) {
-    var sc = c.status === 'recovered' ? 'status-recovered' : c.status === 'pending' ? 'status-pending' : 'status-lost';
-    return '<tr><td>' + fmtCurrency(c.cart_value) + '</td><td>' + fmtCurrency(c.recovery_value || 0) + '</td>'
-      + '<td><span class="status-badge ' + sc + '">' + esc(c.status || 'unknown') + '</span></td>'
-      + '<td class="text-3">' + timeAgo(c.created_at) + '</td></tr>';
-  }).join('')
-  : '<tr><td colspan="4"><div class="empty-state"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="32" height="32"><circle cx="9" cy="21" r="1"/><circle cx="20" cy="21" r="1"/><path d="M1 1h4l2.68 13.39a2 2 0 0 0 2 1.61h9.72a2 2 0 0 0 2-1.61L23 6H6"/></svg><p>No cart recovery data yet</p></div></td></tr>';
-
-  // Leads table (last 8 newest first)
-  var leadRows = leads.slice(-8).reverse();
-  var leadHtml = leadRows.length ? leadRows.map(function (l) {
-    var score = l.score || 0;
-    var sc = score >= 70 ? 'status-hot' : score >= 40 ? 'status-warm' : 'status-cold';
-    return '<tr><td><span class="status-badge ' + sc + '">' + score + '</span></td>'
-      + '<td class="text-2">' + esc(l.category || 'inbound') + '</td>'
-      + '<td class="text-3">' + timeAgo(l.created_at) + '</td></tr>';
-  }).join('')
-  : '<tr><td colspan="3"><div class="empty-state"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="32" height="32"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></svg><p>No lead data yet</p></div></td></tr>';
-
-  return '<div class="view-header">'
-    + '<div class="view-greeting">Analytics</div>'
-    + '<div class="view-sub">Performance across AI workflows</div>'
-    + '</div>'
-    + '<div class="analytics-metrics">' + metricCards + '</div>'
-    + '<div class="analytics-tables">'
-    + '<div class="table-card"><div class="table-card-header">Cart Recovery</div>'
-    + '<table class="data-table"><thead><tr><th>Cart Value</th><th>Recovered</th><th>Status</th><th>Time</th></tr></thead><tbody>' + cartHtml + '</tbody></table></div>'
-    + '<div class="table-card"><div class="table-card-header">Recent Leads</div>'
-    + '<table class="data-table"><thead><tr><th>Score</th><th>Category</th><th>Time</th></tr></thead><tbody>' + leadHtml + '</tbody></table></div>'
-    + '</div>';
-}
-
-// ── View: Integrations ─────────────────────────────
-async function viewIntegrations() {
-  var integrations = await fetchIntegrations();
-
-  if (!integrations || integrations.length === 0) {
-    return '<div class="empty-state" style="padding-top:4rem">'
-      + '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="48" height="48"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/></svg>'
-      + '<p>No integration data available</p></div>';
-  }
-
-  var checkIcon = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" width="24" height="24"><polyline points="20 6 9 17 4 12"/></svg>';
-  var xIcon     = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" width="24" height="24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>';
-
-  var cards = integrations.map(function (integ, i) {
-    var ok = integ.connected;
-    var wfBadges = (integ.workflows || []).map(function (w) {
-      return '<span class="wf-badge-sm">' + esc(w) + '</span>';
-    }).join('');
-
-    return '<div class="integration-card ' + (ok ? 'connected' : 'disconnected') + '" style="animation-delay:' + (i * 40) + 'ms">'
-      + '<div class="integration-status-icon ' + (ok ? 'ok' : 'err') + '">' + (ok ? checkIcon : xIcon) + '</div>'
-      + '<div class="integration-name">' + esc(integ.label) + '</div>'
-      + '<div class="integration-status-text ' + (ok ? 'ok' : 'err') + '">' + (ok ? 'Connected' : esc(integ.env_var)) + '</div>'
-      + '<div class="integration-workflows">' + wfBadges + '</div>'
-      + '</div>';
-  }).join('');
-
-  var connectedCount = integrations.filter(function (i) { return i.connected; }).length;
-
-  return '<div class="view-header">'
-    + '<div class="view-greeting">Integrations</div>'
-    + '<div class="view-sub">' + connectedCount + ' of ' + integrations.length + ' services connected</div>'
-    + '</div>'
-    + '<div class="integrations-grid">' + cards + '</div>';
-}
-
-// ── View: Settings ─────────────────────────────────
-async function viewSettings() {
-  var cfg = state.config || {};
-
-  function v(key, fallback) {
-    fallback = fallback != null ? fallback : '';
-    return esc(cfg[key] != null ? cfg[key] : fallback);
-  }
-
-  var chevronSvg = '<svg class="settings-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="18" height="18"><polyline points="6 9 12 15 18 9"/></svg>';
-
-  var brandSection = '<div class="settings-section open" data-section="brand">'
-    + '<button class="settings-section-trigger" data-toggle-section="brand"><span>Brand Identity</span>' + chevronSvg + '</button>'
-    + '<div class="settings-section-body">'
-    + '<div class="settings-field-grid">'
-    + '<div class="field-group"><label class="field-label">Brand Name</label><input type="text" class="field-input" data-field="brand_name" value="' + v('brand_name') + '" /></div>'
-    + '<div class="field-group"><label class="field-label">Store URL</label><input type="url" class="field-input" data-field="store_url" value="' + v('store_url') + '" /></div>'
-    + '<div class="field-group"><label class="field-label">Brand Voice</label><input type="text" class="field-input" data-field="brand_voice" value="' + v('brand_voice') + '" placeholder="e.g. friendly, professional" /></div>'
-    + '<div class="field-group"><label class="field-label">Calendly URL</label><input type="url" class="field-input" data-field="calendly_url" value="' + v('calendly_url') + '" /></div>'
-    + '<div class="field-group"><label class="field-label">Logo URL</label><input type="url" class="field-input" data-field="logo_url" value="' + v('logo_url') + '" /></div>'
-    + '<div class="field-group"><label class="field-label">Primary Color</label><input type="text" class="field-input" data-field="primary_color" value="' + v('primary_color') + '" placeholder="#38bdf8" /></div>'
-    + '</div>'
-    + '<div class="settings-footer"><span class="dirty-indicator" data-dirty="brand">Unsaved changes</span><button class="btn btn-primary btn-sm" data-settings-section="brand" disabled>Save changes</button></div>'
-    + '</div></div>';
-
-  var contactSection = '<div class="settings-section" data-section="contact">'
-    + '<button class="settings-section-trigger" data-toggle-section="contact"><span>Contact Details</span>' + chevronSvg + '</button>'
-    + '<div class="settings-section-body">'
-    + '<div class="settings-field-grid">'
-    + '<div class="field-group"><label class="field-label">Strategy Email</label><input type="email" class="field-input" data-field="strategy_email" value="' + v('strategy_email') + '" /></div>'
-    + '<div class="field-group"><label class="field-label">Ops Email</label><input type="email" class="field-input" data-field="ops_email" value="' + v('ops_email') + '" /></div>'
-    + '<div class="field-group"><label class="field-label">Finance Email</label><input type="email" class="field-input" data-field="finance_email" value="' + v('finance_email') + '" /></div>'
-    + '<div class="field-group"><label class="field-label">Support Email</label><input type="email" class="field-input" data-field="support_email" value="' + v('support_email') + '" /></div>'
-    + '<div class="field-group"><label class="field-label">CEO Phone (WhatsApp)</label><input type="tel" class="field-input" data-field="ceo_phone" value="' + v('ceo_phone') + '" placeholder="+1234567890" /></div>'
-    + '</div>'
-    + '<div class="settings-footer"><span class="dirty-indicator" data-dirty="contact">Unsaved changes</span><button class="btn btn-primary btn-sm" data-settings-section="contact" disabled>Save changes</button></div>'
-    + '</div></div>';
-
-  var featureFlags = [
-    { key: 'feature_loyalty',      label: 'Loyalty Engine' },
-    { key: 'feature_gamification', label: 'Gamified Checkout' },
-    { key: 'feature_rag',          label: 'RAG Brain' },
-    { key: 'feature_amazon',       label: 'Amazon PDP' },
-    { key: 'feature_ugc',          label: 'UGC Collect' },
-    { key: 'feature_tax_reports',  label: 'Tax Reports' },
-  ];
-
-  var flagCards = featureFlags.map(function (f) {
-    return '<div class="settings-flag">'
-      + '<span class="settings-flag-label">' + esc(f.label) + '</span>'
-      + '<label class="toggle-wrap" title="Toggle ' + esc(f.label) + '">'
-      + '<input type="checkbox" class="toggle-input" data-field="' + esc(f.key) + '"' + (cfg[f.key] ? ' checked' : '') + ' />'
-      + '<span class="toggle-track"></span>'
-      + '</label>'
-      + '</div>';
-  }).join('');
-
-  var featureSection = '<div class="settings-section" data-section="features">'
-    + '<button class="settings-section-trigger" data-toggle-section="features"><span>Feature Flags</span>' + chevronSvg + '</button>'
-    + '<div class="settings-section-body">'
-    + '<div class="settings-flag-grid">' + flagCards + '</div>'
-    + '<div class="settings-footer"><span class="dirty-indicator" data-dirty="features">Unsaved changes</span><button class="btn btn-primary btn-sm" data-settings-section="features" disabled>Save changes</button></div>'
-    + '</div></div>';
-
-  var thresholdSection = '<div class="settings-section" data-section="thresholds">'
-    + '<button class="settings-section-trigger" data-toggle-section="thresholds"><span>Thresholds &amp; Limits</span>' + chevronSvg + '</button>'
-    + '<div class="settings-section-body">'
-    + '<div class="settings-field-grid grid-3">'
-    + '<div class="field-group"><label class="field-label">Free Shipping Threshold ($)</label><input type="number" class="field-input" data-field="free_shipping_threshold" value="' + v('free_shipping_threshold') + '" placeholder="50" /></div>'
-    + '<div class="field-group"><label class="field-label">Hot Lead Score</label><input type="number" class="field-input" data-field="lead_hot_score_threshold" value="' + v('lead_hot_score_threshold') + '" placeholder="70" /></div>'
-    + '<div class="field-group"><label class="field-label">Churn Risk Threshold</label><input type="number" class="field-input" data-field="churn_risk_threshold" value="' + v('churn_risk_threshold') + '" placeholder="0.7" step="0.1" /></div>'
-    + '<div class="field-group"><label class="field-label">ROAS Alert Threshold</label><input type="number" class="field-input" data-field="roas_alert_threshold" value="' + v('roas_alert_threshold') + '" placeholder="2.0" step="0.1" /></div>'
-    + '<div class="field-group"><label class="field-label">Winback Stage 2 (days)</label><input type="number" class="field-input" data-field="winback_stage2_days" value="' + v('winback_stage2_days') + '" placeholder="30" /></div>'
-    + '<div class="field-group"><label class="field-label">Winback Stage 3 (days)</label><input type="number" class="field-input" data-field="winback_stage3_days" value="' + v('winback_stage3_days') + '" placeholder="60" /></div>'
-    + '</div>'
-    + '<div class="settings-footer"><span class="dirty-indicator" data-dirty="thresholds">Unsaved changes</span><button class="btn btn-primary btn-sm" data-settings-section="thresholds" disabled>Save changes</button></div>'
-    + '</div></div>';
-
-  return '<div class="view-header">'
-    + '<div class="view-greeting">Settings</div>'
-    + '<div class="view-sub">Configure workspace &amp; workflow preferences</div>'
-    + '</div>'
-    + '<div class="settings-sections">'
-    + brandSection + contactSection + featureSection + thresholdSection
-    + '</div>';
-}
-
-// ── Settings field map ─────────────────────────────
-var SECTION_FIELDS = {
-  brand:      ['brand_name', 'store_url', 'brand_voice', 'calendly_url', 'logo_url', 'primary_color'],
-  contact:    ['strategy_email', 'ops_email', 'finance_email', 'support_email', 'ceo_phone'],
-  features:   ['feature_loyalty', 'feature_gamification', 'feature_rag', 'feature_amazon', 'feature_ugc', 'feature_tax_reports'],
-  thresholds: ['free_shipping_threshold', 'lead_hot_score_threshold', 'churn_risk_threshold',
-               'roas_alert_threshold', 'winback_stage2_days', 'winback_stage3_days'],
+// ── Navigation ────────────────────────────────────
+const VIEW_RENDERERS = {
+  overview:     viewOverview,
+  'live-feed':  viewLiveFeed,
+  workflows:    viewWorkflows,
+  analytics:    viewAnalytics,
+  logs:         viewLogs,
+  content:      viewContent,
+  'ab-tests':   viewAbTests,
+  knowledge:    viewKnowledge,
+  integrations: viewIntegrations,
+  settings:     viewSettings,
 };
 
-// ── Workflow Config Drawer ─────────────────────────
-
-function openWorkflowDrawer(wfId, catColor) {
-  closeWorkflowDrawer();
-
-  // Find workflow meta
-  var wfMeta = null;
-  CATEGORIES.forEach(function (cat) {
-    cat.workflows.forEach(function (wf) { if (wf.id === wfId) wfMeta = Object.assign({}, wf, { color: cat.color }); });
-  });
-  if (!wfMeta) return;
-
-  var color = catColor || wfMeta.color || '#38bdf8';
-  var wfState = (state.cache.workflows || []).find(function (w) { return w.workflow_id === wfId; }) || {};
-  var overrides = wfState.config_overrides || {};
-  var options = WORKFLOW_CONFIG[wfId] || [];
-  var outgoing = CASCADE_DISPLAY[wfId] || [];
-  var incoming = CASCADE_RECEIVES[wfId] || [];
-
-  // ── Config fields ────────────────────────────────
-  var fieldsHtml = options.length
-    ? options.map(function (opt) {
-        var val = overrides[opt.key] !== undefined ? overrides[opt.key] : opt.default;
-        var input = '';
-        if (opt.type === 'bool') {
-          input = '<label class="toggle-wrap" title="' + esc(opt.label) + '">'
-            + '<input type="checkbox" class="toggle-input drawer-field" data-opt-key="' + esc(opt.key) + '" ' + (val ? 'checked' : '') + ' />'
-            + '<span class="toggle-track"></span></label>';
-        } else if (opt.type === 'select') {
-          input = '<select class="field-input drawer-field" data-opt-key="' + esc(opt.key) + '">'
-            + (opt.options || []).map(function (o) {
-                return '<option value="' + esc(o) + '"' + (val === o ? ' selected' : '') + '>' + esc(o) + '</option>';
-              }).join('')
-            + '</select>';
-        } else {
-          input = '<input type="' + (opt.type === 'number' ? 'number' : 'text') + '" class="field-input drawer-field" '
-            + 'data-opt-key="' + esc(opt.key) + '" value="' + esc(String(val)) + '" '
-            + (opt.type === 'number' ? 'step="any" ' : '') + '/>';
-        }
-        return '<div class="drawer-field-row">'
-          + '<div class="drawer-field-meta"><span class="drawer-field-label">' + esc(opt.label) + '</span>'
-          + '<span class="drawer-field-desc">' + esc(opt.desc) + '</span></div>'
-          + '<div class="drawer-field-control">' + input + '</div>'
-          + '</div>';
-      }).join('')
-    : '<p class="drawer-empty-note">No configurable options for this workflow.</p>';
-
-  // ── Cascade chain section ────────────────────────
-  var chainHtml = '';
-  if (outgoing.length || incoming.length) {
-    chainHtml = '<div class="drawer-section"><div class="drawer-section-title">Agent Cascade Chain</div>';
-    if (incoming.length) {
-      chainHtml += '<div class="cascade-chain-group"><span class="cascade-chain-dir">Triggered by</span>'
-        + incoming.map(function (c) {
-            return '<div class="cascade-chain-item in"><span class="cascade-node">' + esc(c.from) + '</span>'
-              + '<span class="cascade-arrow">→</span><span class="cascade-node self">' + esc(wfId) + '</span>'
-              + '<span class="cascade-chain-label">' + esc(c.label) + '</span></div>';
-          }).join('')
-        + '</div>';
-    }
-    if (outgoing.length) {
-      chainHtml += '<div class="cascade-chain-group"><span class="cascade-chain-dir">Triggers downstream</span>'
-        + outgoing.map(function (c) {
-            return '<div class="cascade-chain-item out"><span class="cascade-node self">' + esc(wfId) + '</span>'
-              + '<span class="cascade-arrow">→</span><span class="cascade-node">' + esc(c.to) + '</span>'
-              + '<span class="cascade-chain-label">' + esc(c.label) + '</span></div>';
-          }).join('')
-        + '</div>';
-    }
-    chainHtml += '</div>';
-  }
-
-  // ── Recent cascade log ───────────────────────────
-  var recentEvents = cascadeLog.filter(function (e) {
-    return e.from === wfId || e.to === wfId || e.workflow_id === wfId;
-  }).slice(0, 6);
-
-  var logHtml = recentEvents.length
-    ? '<div class="drawer-section"><div class="drawer-section-title">Recent Activity</div>'
-      + '<div class="cascade-event-log">'
-      + recentEvents.map(function (e) {
-          var icon = e.type === 'cascade_start' ? '⚡' : e.type === 'cascade_complete' ? '✓' : e.type === 'cascade_error' ? '✗' : '◉';
-          var cls  = e.type === 'cascade_error' ? 'cascade-event-err' : e.type === 'cascade_complete' ? 'cascade-event-ok' : 'cascade-event-info';
-          var text = e.label || (e.from ? e.from + ' → ' + e.to : e.workflow_id + ' ' + (e.status || ''));
-          return '<div class="cascade-event-row ' + cls + '">'
-            + '<span class="cascade-event-icon">' + icon + '</span>'
-            + '<span class="cascade-event-text">' + esc(text) + '</span>'
-            + '<span class="cascade-event-time">' + timeAgo(e.ts) + '</span>'
-            + '</div>';
-        }).join('')
-      + '</div></div>'
-    : '';
-
-  // ── Trigger form ─────────────────────────────────
-  var triggerHtml = '<div class="drawer-section"><div class="drawer-section-title">Manual Trigger</div>'
-    + '<p class="drawer-trigger-note">Runs this workflow immediately with a test payload. Cascades fire automatically based on the result.</p>'
-    + '<div class="drawer-trigger-area" id="trigger-area-' + esc(wfId) + '">'
-    + '<div class="trigger-result hidden" id="trigger-result-' + esc(wfId) + '"></div>'
-    + '<button class="btn btn-primary" id="trigger-run-btn-' + esc(wfId) + '" data-wf-id="' + esc(wfId) + '">'
-    + '<span class="btn-label">Run workflow now</span>'
-    + '<span class="btn-spinner hidden">Running…</span>'
-    + '</button>'
-    + '</div></div>';
-
-  // ── Full drawer HTML ─────────────────────────────
-  var drawerHtml = '<div class="wf-drawer" id="wf-drawer">'
-    + '<div class="wf-drawer-overlay" id="wf-drawer-overlay"></div>'
-    + '<div class="wf-drawer-panel">'
-    + '<div class="wf-drawer-header" style="border-top:3px solid ' + esc(color) + '">'
-    + '<div style="display:flex;align-items:center;gap:0.75rem">'
-    + '<div class="wf-id-badge" style="background:' + hexAlpha(color, 0.15) + ';color:' + esc(color) + ';font-size:0.8rem">' + esc(wfId) + '</div>'
-    + '<div><div class="wf-drawer-name">' + esc(wfMeta.name) + '</div>'
-    + '<div class="wf-drawer-desc">' + esc(wfMeta.desc) + '</div></div>'
-    + '</div>'
-    + '<button class="wf-drawer-close" id="wf-drawer-close" title="Close">'
-    + '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" width="20" height="20"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>'
-    + '</button>'
-    + '</div>'
-    + '<div class="wf-drawer-body">'
-    + chainHtml
-    + '<div class="drawer-section"><div class="drawer-section-title">Configuration'
-    + '<button class="btn btn-primary btn-xs" id="drawer-save-btn" data-wf-id="' + esc(wfId) + '" style="margin-left:auto">Save</button>'
-    + '</div>'
-    + '<div class="drawer-fields">' + fieldsHtml + '</div>'
-    + '</div>'
-    + triggerHtml
-    + logHtml
-    + '</div>'
-    + '</div>'
-    + '</div>';
-
-  var container = document.createElement('div');
-  container.innerHTML = drawerHtml;
-  document.body.appendChild(container);
-
-  // Animate in
-  requestAnimationFrame(function () {
-    var panel = document.querySelector('.wf-drawer-panel');
-    if (panel) panel.classList.add('open');
-  });
-
-  // Live cascade feed into the log
-  var offFeed = onCascadeEvent(function (event) {
-    if (event.from !== wfId && event.to !== wfId && event.workflow_id !== wfId) return;
-    var logEl = document.querySelector('.cascade-event-log');
-    if (!logEl) return;
-    var icon = event.type === 'cascade_start' ? '⚡' : event.type === 'cascade_complete' ? '✓' : event.type === 'cascade_error' ? '✗' : '◉';
-    var cls  = event.type === 'cascade_error' ? 'cascade-event-err' : event.type === 'cascade_complete' ? 'cascade-event-ok' : 'cascade-event-info';
-    var text = event.label || (event.from ? event.from + ' → ' + event.to : (event.workflow_id || '') + ' ' + (event.status || ''));
-    var row = document.createElement('div');
-    row.className = 'cascade-event-row ' + cls + ' cascade-event-new';
-    row.innerHTML = '<span class="cascade-event-icon">' + icon + '</span>'
-      + '<span class="cascade-event-text">' + esc(text) + '</span>'
-      + '<span class="cascade-event-time">Just now</span>';
-    logEl.prepend(row);
-    setTimeout(function () { row.classList.remove('cascade-event-new'); }, 600);
-    if (logEl.children.length > 8) logEl.lastElementChild.remove();
-  });
-
-  // Ensure log section exists for live events
-  if (!recentEvents.length) {
-    var body = document.querySelector('.wf-drawer-body');
-    var logSection = document.createElement('div');
-    logSection.className = 'drawer-section';
-    logSection.id = 'drawer-log-section-' + wfId;
-    logSection.innerHTML = '<div class="drawer-section-title">Recent Activity</div>'
-      + '<div class="cascade-event-log"></div>';
-    body.appendChild(logSection);
-  }
-
-  // Close handlers
-  function doClose() { offFeed(); closeWorkflowDrawer(); }
-  document.getElementById('wf-drawer-close').addEventListener('click', doClose);
-  document.getElementById('wf-drawer-overlay').addEventListener('click', doClose);
-
-  // Save config
-  document.getElementById('drawer-save-btn').addEventListener('click', function () {
-    var id = this.dataset.wfId;
-    var panel = document.querySelector('.wf-drawer-panel');
-    var newOverrides = {};
-    panel.querySelectorAll('.drawer-field').forEach(function (inp) {
-      var key = inp.dataset.optKey;
-      if (!key) return;
-      if (inp.type === 'checkbox') { newOverrides[key] = inp.checked; }
-      else if (inp.type === 'number') { newOverrides[key] = parseFloat(inp.value); }
-      else { newOverrides[key] = inp.value; }
-    });
-    saveWorkflowOverrides(id, newOverrides);
-  });
-
-  // Trigger run
-  document.getElementById('trigger-run-btn-' + wfId).addEventListener('click', function () {
-    runWorkflowTrigger(wfId);
-  });
+function navTo(view) {
+  document.querySelectorAll('.nav-item').forEach(el => el.classList.toggle('active', el.dataset.view === view));
+  const main = document.getElementById('main-content');
+  main.innerHTML = '<div class="skeleton skel-h40 skel-mb8"></div><div class="skeleton skel-h80 skel-mb8"></div><div class="skeleton skel-h80"></div>';
+  const fn = VIEW_RENDERERS[view];
+  if (fn) fn(main);
 }
 
-function closeWorkflowDrawer() {
-  var drawer = document.getElementById('wf-drawer');
-  if (!drawer) return;
-  var panel = drawer.querySelector('.wf-drawer-panel');
-  if (panel) {
-    panel.classList.remove('open');
-    setTimeout(function () { drawer.remove(); }, 280);
-  } else {
-    drawer.remove();
-  }
-}
+// ═══════════════════════════════════════════════════
+// VIEW: OVERVIEW
+// ═══════════════════════════════════════════════════
+async function viewOverview(el) {
+  const [wfsData, analyticsData] = await Promise.all([
+    api('GET', `/api/tenants/${state.slug}/workflows`),
+    api('GET', `/api/tenants/${state.slug}/analytics`),
+  ]);
 
-async function saveWorkflowOverrides(wfId, overrides) {
-  var btn = document.getElementById('drawer-save-btn');
-  if (btn) { btn.disabled = true; btn.textContent = 'Saving…'; }
-  try {
-    await api('/api/tenants/' + encodeURIComponent(state.slug) + '/workflows/' + encodeURIComponent(wfId), {
-      method: 'PATCH',
-      body: JSON.stringify({ config_overrides: overrides }),
-    });
-    // Update cache
-    var wf = (state.cache.workflows || []).find(function (w) { return w.workflow_id === wfId; });
-    if (wf) wf.config_overrides = overrides;
-    toast(wfId + ' settings saved', 'success');
-  } catch (err) {
-    toast('Save failed: ' + err.message, 'error');
-  } finally {
-    if (btn) { btn.disabled = false; btn.textContent = 'Save'; }
-  }
-}
+  const activeWfs   = wfsData.filter(w => w.is_active).length;
+  const leads       = analyticsData.leads || [];
+  const carts       = analyticsData.carts || [];
+  const loyalty     = analyticsData.loyalty || [];
+  const tickets     = analyticsData.tickets || [];
 
-async function runWorkflowTrigger(wfId) {
-  var btn     = document.getElementById('trigger-run-btn-' + wfId);
-  var resultEl = document.getElementById('trigger-result-' + wfId);
-  if (!btn) return;
+  const hotLeads    = leads.filter(l => l.category === 'hot').length;
+  const recovered   = carts.filter(c => c.status === 'recovered').length;
+  const recovVal    = carts.filter(c => c.status === 'recovered').reduce((s, c) => s + (c.recovery_value || 0), 0);
+  const loyPts      = loyalty.reduce((s, l) => s + (l.points || 0), 0);
+  const closedTx    = tickets.filter(t => t.status === 'closed').length;
 
-  var labelEl  = btn.querySelector('.btn-label');
-  var spinnerEl = btn.querySelector('.btn-spinner');
-  btn.disabled = true;
-  if (labelEl)  labelEl.classList.add('hidden');
-  if (spinnerEl) spinnerEl.classList.remove('hidden');
-  if (resultEl) resultEl.classList.add('hidden');
-
-  try {
-    var data = await api(
-      '/api/tenants/' + encodeURIComponent(state.slug) + '/workflows/' + encodeURIComponent(wfId) + '/trigger',
-      { method: 'POST', body: JSON.stringify({ payload: {} }) }
-    );
-    if (resultEl) {
-      resultEl.className = 'trigger-result trigger-result-ok';
-      resultEl.textContent = 'Completed: ' + JSON.stringify(data.result || data, null, 2).slice(0, 300);
-      resultEl.classList.remove('hidden');
-    }
-    // Refresh workflow stats after run
-    delete state.cache.workflows;
-    toast(wfId + ' ran successfully', 'success');
-  } catch (err) {
-    if (resultEl) {
-      resultEl.className = 'trigger-result trigger-result-err';
-      resultEl.textContent = 'Error: ' + err.message;
-      resultEl.classList.remove('hidden');
-    }
-    toast(wfId + ' run failed: ' + err.message, 'error');
-  } finally {
-    btn.disabled = false;
-    if (labelEl)  labelEl.classList.remove('hidden');
-    if (spinnerEl) spinnerEl.classList.add('hidden');
-  }
-}
-
-// ── Toggle workflow ────────────────────────────────
-async function toggleWorkflow(wfId, isActive) {
-  // Optimistic update
-  if (state.cache.workflows) {
-    var wf = state.cache.workflows.find(function (w) { return w.workflow_id === wfId; });
-    if (wf) wf.is_active = isActive;
-  }
-  try {
-    await api('/api/tenants/' + encodeURIComponent(state.slug) + '/workflows/' + encodeURIComponent(wfId), {
-      method: 'PATCH',
-      body: JSON.stringify({ is_active: isActive }),
-    });
-    toast(wfId + ' ' + (isActive ? 'enabled' : 'disabled'), 'success');
-  } catch (err) {
-    // Revert cache
-    if (state.cache.workflows) {
-      var wfR = state.cache.workflows.find(function (w) { return w.workflow_id === wfId; });
-      if (wfR) wfR.is_active = !isActive;
-    }
-    // Revert DOM
-    var inp = document.querySelector('.toggle-input[data-wf-id="' + wfId.replace(/"/g, '\\"') + '"]');
-    if (inp) inp.checked = !isActive;
-    toast('Failed to toggle ' + wfId + ': ' + err.message, 'error');
-  }
-}
-
-// ── Save config section ────────────────────────────
-async function saveConfig(section, sectionEl) {
-  var fields = SECTION_FIELDS[section] || [];
-  var updates = {};
-  fields.forEach(function (field) {
-    var inp = sectionEl.querySelector('[data-field="' + field + '"]');
-    if (!inp) return;
-    if (inp.type === 'checkbox') {
-      updates[field] = inp.checked;
-    } else if (inp.type === 'number') {
-      var val = inp.value.trim();
-      if (val !== '') updates[field] = parseFloat(val);
-    } else {
-      var strVal = inp.value.trim();
-      if (strVal !== '') updates[field] = strVal;
-    }
-  });
-
-  if (Object.keys(updates).length === 0) {
-    toast('No fields to update', 'error');
-    return;
-  }
-
-  var btn = sectionEl.querySelector('[data-settings-section="' + section + '"]');
-  var labelEl = btn && btn.querySelector('.btn-label');
-  if (btn) {
-    btn.disabled = true;
-    if (labelEl) labelEl.textContent = 'Saving...';
-    else btn.textContent = 'Saving...';
-  }
-
-  try {
-    var result = await api('/api/tenants/' + encodeURIComponent(state.slug) + '/config', {
-      method: 'PUT',
-      body: JSON.stringify(updates),
-    });
-    Object.assign(state.config, result);
-    var dirtyEl = sectionEl.querySelector('[data-dirty="' + section + '"]');
-    if (dirtyEl) dirtyEl.classList.remove('visible');
-    if (btn) {
-      btn.disabled = true;
-      if (labelEl) labelEl.textContent = 'Save changes';
-      else btn.textContent = 'Save changes';
-    }
-    toast('Settings saved', 'success');
-  } catch (err) {
-    toast('Save failed: ' + err.message, 'error');
-    if (btn) {
-      btn.disabled = false;
-      if (labelEl) labelEl.textContent = 'Save changes';
-      else btn.textContent = 'Save changes';
-    }
-  }
-}
-
-// ── Onboard submit ─────────────────────────────────
-async function submitOnboard(formEl) {
-  var slug = formEl.querySelector('#ob-slug').value.trim();
-  var name = formEl.querySelector('#ob-name').value.trim();
-  var plan = formEl.querySelector('#ob-plan').value;
-
-  if (!slug || !name) {
-    toast('Workspace slug and client name are required', 'error');
-    return;
-  }
-
-  var brand = {};
-
-  var brandName = formEl.querySelector('#ob-brand-name').value.trim();
-  if (brandName) brand.brand_name = brandName;
-
-  var storeUrl = formEl.querySelector('#ob-store-url').value.trim();
-  if (storeUrl) brand.store_url = storeUrl;
-
-  var shopifyDomain = formEl.querySelector('#ob-shopify-domain').value.trim();
-  if (shopifyDomain) brand.shopify_shop_domain = shopifyDomain;
-
-  var shopifyToken = formEl.querySelector('#ob-shopify-token').value.trim();
-  if (shopifyToken) brand.shopify_access_token = shopifyToken;
-
-  var calendly = formEl.querySelector('#ob-calendly').value.trim();
-  if (calendly) brand.calendly_url = calendly;
-
-  var shipping = formEl.querySelector('#ob-shipping').value.trim();
-  if (shipping) brand.free_shipping_threshold = parseFloat(shipping);
-
-  var strategyEmail = formEl.querySelector('#ob-strategy-email').value.trim();
-  if (strategyEmail) brand.strategy_email = strategyEmail;
-
-  var opsEmail = formEl.querySelector('#ob-ops-email').value.trim();
-  if (opsEmail) brand.ops_email = opsEmail;
-
-  var financeEmail = formEl.querySelector('#ob-finance-email').value.trim();
-  if (financeEmail) brand.finance_email = financeEmail;
-
-  var ceoPhone = formEl.querySelector('#ob-ceo-phone').value.trim();
-  if (ceoPhone) brand.ceo_phone = ceoPhone;
-
-  // Feature flags
-  formEl.querySelectorAll('.flag-card input[type="checkbox"]').forEach(function (cb) {
-    brand[cb.name] = cb.checked;
-  });
-
-  var body = { tenantSlug: slug, tenantName: name, plan: plan, brand: brand };
-
-  var btn = document.getElementById('onboard-submit-btn');
-  var labelEl = btn.querySelector('.btn-label');
-  var spinnerEl = btn.querySelector('.btn-spinner');
-  btn.disabled = true;
-  if (labelEl) labelEl.classList.add('hidden');
-  if (spinnerEl) spinnerEl.classList.remove('hidden');
-
-  try {
-    var result = await api('/api/onboard', { method: 'POST', body: JSON.stringify(body) });
-    renderOnboardResult(result);
-    formEl.classList.add('hidden');
-  } catch (err) {
-    toast('Provisioning failed: ' + err.message, 'error');
-  } finally {
-    btn.disabled = false;
-    if (labelEl) labelEl.classList.remove('hidden');
-    if (spinnerEl) spinnerEl.classList.add('hidden');
-  }
-}
-
-function renderOnboardResult(result) {
-  var container = document.getElementById('onboard-result');
-  container.classList.remove('hidden');
-
-  var tenant      = result.tenant      || {};
-  var webhookUrls = result.webhook_urls || {};
-  var nextSteps   = result.next_steps   || [];
-
-  var webhookItems = Object.keys(webhookUrls).map(function (key) {
-    return '<div class="webhook-item">'
-      + '<span class="webhook-key">' + esc(key) + '</span>'
-      + '<span class="webhook-url">' + esc(webhookUrls[key]) + '</span>'
-      + '</div>';
+  const wfRows = wfsData.slice(0, 8).map(w => {
+    const meta = CATEGORIES.flatMap(c => c.workflows).find(m => m.id === w.workflow_id);
+    return `<tr>
+      <td><span class="fw-600">${w.workflow_id}</span></td>
+      <td class="truncate" style="max-width:160px">${meta?.name || w.workflow_id}</td>
+      <td><span class="status-badge ${w.is_active ? 'completed' : ''}">${w.is_active ? 'Active' : 'Off'}</span></td>
+      <td>${(w.run_count || 0).toLocaleString()}</td>
+      <td style="color:${(w.error_count||0)>0?'var(--red)':'var(--text-3)'}">${w.error_count || 0}</td>
+    </tr>`;
   }).join('');
 
-  var nextStepsHtml = nextSteps.map(function (s) { return '<li>' + esc(s) + '</li>'; }).join('');
+  el.innerHTML = `
+    <div class="view-header">
+      <div><div class="view-title">Overview</div><div class="view-sub">Real-time summary for ${state.config?.brand_name || state.slug}</div></div>
+      <button class="btn btn-ghost btn-sm" onclick="navTo('analytics')">Full analytics →</button>
+    </div>
 
-  var planClass = 'plan-' + esc((tenant.plan || 'growth').toLowerCase());
+    <div class="stats-grid">
+      <div class="stat-card">
+        <div class="stat-value">${activeWfs}<span style="font-size:1rem;color:var(--text-3)">/24</span></div>
+        <div class="stat-label">Active workflows</div>
+      </div>
+      <div class="stat-card green">
+        <div class="stat-value">${hotLeads}</div>
+        <div class="stat-label">Hot leads this month</div>
+        <div class="stat-delta up">↑ ${leads.length} total captured</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-value">£${recovVal.toLocaleString('en-GB',{maximumFractionDigits:0})}</div>
+        <div class="stat-label">Cart revenue recovered</div>
+        <div class="stat-delta up">↑ ${recovered} carts rescued</div>
+      </div>
+      <div class="stat-card violet">
+        <div class="stat-value">${loyPts.toLocaleString()}</div>
+        <div class="stat-label">Loyalty points issued</div>
+      </div>
+      <div class="stat-card amber">
+        <div class="stat-value">${closedTx}</div>
+        <div class="stat-label">Support tickets resolved</div>
+      </div>
+      <div class="stat-card green">
+        <div class="stat-value">${wfsData.reduce((s,w)=>s+(w.run_count||0),0).toLocaleString()}</div>
+        <div class="stat-label">Total workflow runs</div>
+      </div>
+      <div class="stat-card pink">
+        <div class="stat-value">${wfsData.reduce((s,w)=>s+(w.error_count||0),0)}</div>
+        <div class="stat-label">Total errors</div>
+      </div>
+      <div class="stat-card emerald">
+        <div class="stat-value">${carts.length > 0 ? Math.round(recovered/carts.length*100) : 0}%</div>
+        <div class="stat-label">Cart recovery rate</div>
+      </div>
+    </div>
 
-  container.innerHTML = '<div class="onboard-result-header">'
-    + '<div class="onboard-result-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" width="20" height="20"><polyline points="20 6 9 17 4 12"/></svg></div>'
-    + '<div><h2>Workspace provisioned!</h2>'
-    + '<div style="margin-top:4px;display:flex;align-items:center;gap:8px">'
-    + '<span style="font-size:0.875rem;color:var(--text-3)">' + esc(tenant.slug) + '</span>'
-    + '<span class="plan-pill ' + planClass + '">' + esc(tenant.plan || 'growth') + '</span>'
-    + '</div></div></div>'
-    + (webhookItems ? '<div class="webhook-section-title">Webhook URLs</div><div class="webhook-list">' + webhookItems + '</div>' : '')
-    + (nextStepsHtml ? '<div class="webhook-section-title" style="margin-top:1rem">Next Steps</div><ul class="next-steps-list">' + nextStepsHtml + '</ul>' : '')
-    + '<div style="display:flex;gap:0.75rem;margin-top:1.5rem">'
-    + '<button class="btn btn-primary" id="result-connect-btn" data-slug="' + esc(tenant.slug) + '">Connect to this workspace</button>'
-    + '<button class="btn btn-ghost" id="result-new-btn">Provision another</button>'
-    + '</div>';
-
-  document.getElementById('result-connect-btn').addEventListener('click', function () {
-    document.getElementById('inp-slug').value = this.dataset.slug;
-    document.getElementById('inp-key').value  = state.key || '';
-    showScreen('screen-connect');
-  });
-
-  document.getElementById('result-new-btn').addEventListener('click', function () {
-    document.getElementById('onboard-form').reset();
-    document.getElementById('onboard-form').classList.remove('hidden');
-    container.classList.add('hidden');
-    container.innerHTML = '';
-  });
+    <div class="card">
+      <div class="card-header">
+        <span class="card-title">Workflow status</span>
+        <button class="btn btn-ghost btn-sm" onclick="navTo('workflows')">Manage all →</button>
+      </div>
+      <table class="log-table">
+        <thead><tr><th>ID</th><th>Name</th><th>Status</th><th>Runs</th><th>Errors</th></tr></thead>
+        <tbody>${wfRows || '<tr><td colspan="5" class="text-muted" style="text-align:center;padding:20px">No workflows configured yet</td></tr>'}</tbody>
+      </table>
+    </div>
+  `;
 }
 
-// ── View listener attachment ───────────────────────
-function attachViewListeners(view, container) {
-  if (view === 'workflows') {
-    // Toggle on/off
-    container.addEventListener('change', function (e) {
-      var inp = e.target.closest ? e.target.closest('.toggle-input[data-wf-id]') : null;
-      if (!inp && e.target.classList && e.target.classList.contains('toggle-input') && e.target.dataset.wfId) {
-        inp = e.target;
-      }
-      if (inp && inp.dataset.wfId) {
-        toggleWorkflow(inp.dataset.wfId, inp.checked);
-      }
-    });
-
-    // Configure button → open drawer
-    container.addEventListener('click', function (e) {
-      var btn = e.target.closest ? e.target.closest('.wf-configure-btn') : null;
-      if (!btn && e.target.classList && e.target.classList.contains('wf-configure-btn')) btn = e.target;
-      if (btn && btn.dataset.wfId) {
-        openWorkflowDrawer(btn.dataset.wfId, btn.dataset.catColor);
-        return;
-      }
-
-      // Run now button → trigger immediately
-      var runBtn = e.target.closest ? e.target.closest('.wf-trigger-btn') : null;
-      if (!runBtn && e.target.classList && e.target.classList.contains('wf-trigger-btn')) runBtn = e.target;
-      if (runBtn && runBtn.dataset.wfId) {
-        runWorkflowTrigger(runBtn.dataset.wfId);
-      }
-    });
-  }
-  if (view === 'settings') {
-    attachSettingsListeners(container);
-  }
+// ═══════════════════════════════════════════════════
+// VIEW: LIVE FEED (SSE)
+// ═══════════════════════════════════════════════════
+function viewLiveFeed(el) {
+  el.innerHTML = `
+    <div class="view-header">
+      <div><div class="view-title">Live Feed</div><div class="view-sub">Real-time workflow events as they happen</div></div>
+      <span id="feed-status" class="pill pill-active">● Live</span>
+    </div>
+    <div id="feed-list" class="feed-list">
+      ${state.feedItems.length === 0 ? `<div class="empty-state"><div class="empty-state-icon">📡</div><h3>Waiting for events</h3><p>Workflow runs will appear here in real time</p></div>` : ''}
+    </div>
+  `;
+  renderFeedItems();
 }
 
-function attachSettingsListeners(container) {
-  // Collapsible toggles
-  container.querySelectorAll('[data-toggle-section]').forEach(function (btn) {
-    btn.addEventListener('click', function () {
-      var sectionEl = btn.closest('.settings-section');
-      if (sectionEl) sectionEl.classList.toggle('open');
-    });
-  });
-
-  // Dirty tracking on inputs
-  function markDirty(inp) {
-    var sectionEl = inp.closest('[data-section]');
-    if (!sectionEl) return;
-    var section = sectionEl.dataset.section;
-    var dirtyEl = sectionEl.querySelector('[data-dirty="' + section + '"]');
-    if (dirtyEl) dirtyEl.classList.add('visible');
-    var saveBtn = sectionEl.querySelector('[data-settings-section="' + section + '"]');
-    if (saveBtn) saveBtn.disabled = false;
-  }
-
-  container.querySelectorAll('[data-field]').forEach(function (inp) {
-    inp.addEventListener('input',  function () { markDirty(inp); });
-    inp.addEventListener('change', function () { markDirty(inp); });
-  });
-
-  // Save buttons
-  container.querySelectorAll('[data-settings-section]').forEach(function (btn) {
-    btn.addEventListener('click', function () {
-      var section = btn.dataset.settingsSection;
-      var sectionEl = container.querySelector('[data-section="' + section + '"]');
-      if (sectionEl) saveConfig(section, sectionEl);
-    });
-  });
+function renderFeedItems() {
+  const list = document.getElementById('feed-list');
+  if (!list) return;
+  if (state.feedItems.length === 0) return;
+  list.innerHTML = state.feedItems.slice(0, 60).map(item => `
+    <div class="feed-item">
+      <div class="feed-dot ${item.type || 'success'}"></div>
+      <div class="feed-body">
+        <div class="feed-title">${item.title}</div>
+        <div class="feed-meta">${item.meta || ''}</div>
+      </div>
+      <div class="feed-time">${item.timeStr}</div>
+    </div>
+  `).join('');
 }
 
-// ── Boot ───────────────────────────────────────────
-document.addEventListener('DOMContentLoaded', function () {
+function pushFeedItem(item) {
+  state.feedItems.unshift(item);
+  if (state.feedItems.length > 100) state.feedItems.pop();
+  document.getElementById('nav-feed-dot') && (document.getElementById('nav-feed-dot').style.display = 'inline-block');
+  renderFeedItems();
+}
 
-  // Sidebar nav
-  document.getElementById('sidebar-nav').addEventListener('click', function (e) {
-    var btn = e.target.closest ? e.target.closest('[data-view]') : null;
-    if (!btn && e.target.dataset && e.target.dataset.view) btn = e.target;
-    if (btn && btn.dataset.view) go(btn.dataset.view);
-  });
+function connectSSE() {
+  if (state.sseSource) state.sseSource.close();
+  const url = `/api/tenants/${state.slug}/events?x-api-key=${encodeURIComponent(state.key)}`;
+  const es = new EventSource(url);
+  state.sseSource = es;
+  es.onmessage = (e) => {
+    try {
+      const ev = JSON.parse(e.data);
+      pushFeedItem({
+        type:    ev.status === 'completed' ? 'success' : ev.status === 'running' ? 'running' : ev.type === 'cascade' ? 'cascade' : 'success',
+        title:   ev.type === 'cascade' ? `Cascade: ${ev.triggered} triggered by ${ev.source}` : `${ev.workflow_id} — ${ev.status}`,
+        meta:    ev.duration ? `${ev.duration}ms` : '',
+        timeStr: new Date().toLocaleTimeString(),
+      });
+    } catch (_) {}
+  };
+  es.onerror = () => { document.getElementById('feed-status') && (document.getElementById('feed-status').className = 'pill pill-amber'); };
+}
 
-  // Connect form
-  document.getElementById('connect-form').addEventListener('submit', async function (e) {
-    e.preventDefault();
-    var slugVal = document.getElementById('inp-slug').value.trim();
-    var keyVal  = document.getElementById('inp-key').value.trim();
-    var errEl   = document.getElementById('connect-error');
-    var btn     = document.getElementById('connect-btn');
-    var labelEl = btn.querySelector('.btn-label');
-    var spinEl  = btn.querySelector('.btn-spinner');
+function startDemoFeed() {
+  const DEMO_EVENTS = [
+    { type: 'success', title: 'A-01 Smart Lead Capture — completed', meta: 'Score: 87 (hot) → Slack #hot-leads + Calendly', timeStr: '' },
+    { type: 'running', title: 'C-01 Cart Recovery — running', meta: 'Wave 1 email queued for 3 carts', timeStr: '' },
+    { type: 'success', title: 'R-02 Loyalty Engine — completed', meta: '450 points issued to emma@test.com', timeStr: '' },
+    { type: 'cascade', title: 'Cascade: R-01 triggered by A-01', meta: 'Post-purchase follow-up sequence started', timeStr: '' },
+    { type: 'success', title: 'SC-04 SEO Meta Writer — completed', meta: '3 product pages optimised', timeStr: '' },
+    { type: 'success', title: 'I-03 Customer Intel — completed', meta: 'CLV prediction updated for 12 customers', timeStr: '' },
+    { type: 'running', title: 'S-01 WhatsApp Support — running', meta: 'Query: "Where is my order #4821"', timeStr: '' },
+    { type: 'success', title: 'S-01 WhatsApp Support — completed', meta: 'Replied in 1.2s — tracking link sent', timeStr: '' },
+    { type: 'success', title: 'A-03 Instagram DM Bot — completed', meta: '2 new leads captured from story replies', timeStr: '' },
+    { type: 'cascade', title: 'Cascade: C-01 triggered by C-04', meta: 'Cart recovery wave 2 triggered', timeStr: '' },
+  ];
+  let idx = 0;
+  const tick = () => {
+    const ev = { ...DEMO_EVENTS[idx % DEMO_EVENTS.length], timeStr: new Date().toLocaleTimeString() };
+    pushFeedItem(ev);
+    idx++;
+  };
+  tick();
+  state.demoFeedTimer = setInterval(tick, 4000);
+}
 
-    if (!slugVal || !keyVal) {
-      errEl.textContent = 'Please enter both slug and access key.';
-      errEl.classList.remove('hidden');
+// ═══════════════════════════════════════════════════
+// VIEW: WORKFLOWS
+// ═══════════════════════════════════════════════════
+async function viewWorkflows(el) {
+  const wfsData = await api('GET', `/api/tenants/${state.slug}/workflows`);
+  const wfMap   = {};
+  wfsData.forEach(w => { wfMap[w.workflow_id] = w; });
+
+  const catFilter = el._catFilter || 'all';
+
+  function renderCards() {
+    const cats = catFilter === 'all' ? CATEGORIES : CATEGORIES.filter(c => c.id === catFilter);
+    return cats.map(cat => `
+      <div class="section-heading">${cat.label}</div>
+      <div class="wf-grid">
+        ${cat.workflows.map(wf => {
+          const state_wf = wfMap[wf.id] || { is_active: false, run_count: 0, error_count: 0 };
+          const isActive = state_wf.is_active;
+          return `
+            <div class="wf-card" id="wf-card-${wf.id}">
+              <div class="wf-card-header">
+                <div class="wf-icon ${cat.cls}">${wf.id}</div>
+                <div class="wf-info">
+                  <div class="wf-id">${cat.label}</div>
+                  <div class="wf-name">${wf.name}</div>
+                </div>
+              </div>
+              <div class="wf-desc">${wf.desc}</div>
+              <div class="wf-footer">
+                <div class="wf-stats">
+                  <span>${(state_wf.run_count || 0).toLocaleString()} runs</span>
+                  <span style="color:${(state_wf.error_count||0)>0?'var(--red)':'var(--text-3)'}">${state_wf.error_count || 0} errors</span>
+                </div>
+                <div class="wf-actions">
+                  <button class="btn btn-ghost btn-xs" onclick="triggerModal('${wf.id}')">▶ Run</button>
+                  <label class="toggle">
+                    <input type="checkbox" ${isActive ? 'checked' : ''} onchange="toggleWorkflow('${wf.id}', this.checked)"/>
+                    <div class="toggle-track"></div>
+                    <div class="toggle-thumb"></div>
+                  </label>
+                </div>
+              </div>
+            </div>
+          `;
+        }).join('')}
+      </div>
+    `).join('');
+  }
+
+  el.innerHTML = `
+    <div class="view-header">
+      <div><div class="view-title">Workflows</div><div class="view-sub">24 AI automations — toggle on/off or trigger manually</div></div>
+    </div>
+    <div style="display:flex;gap:8px;margin-bottom:20px;flex-wrap:wrap">
+      <button class="btn btn-sm ${catFilter==='all'?'btn-primary':'btn-ghost'}" onclick="filterWorkflows('all')">All</button>
+      ${CATEGORIES.map(c => `<button class="btn btn-sm ${catFilter===c.id?'btn-primary':'btn-ghost'}" onclick="filterWorkflows('${c.id}')">${c.label}</button>`).join('')}
+    </div>
+    <div id="wf-cards-wrap">${renderCards()}</div>
+  `;
+  el._catFilter = catFilter;
+}
+
+window.filterWorkflows = function(cat) {
+  const el = document.getElementById('main-content');
+  el._catFilter = cat;
+  viewWorkflows(el);
+};
+
+window.toggleWorkflow = async function(wfId, active) {
+  try {
+    await api('PATCH', `/api/tenants/${state.slug}/workflows/${wfId}`, { is_active: active });
+    toast(`${wfId} ${active ? 'activated' : 'deactivated'}`, 'success');
+  } catch (e) { toast(e.message, 'error'); }
+};
+
+window.triggerModal = async function(wfId) {
+  const meta = CATEGORIES.flatMap(c => c.workflows).find(m => m.id === wfId);
+  let payload = {};
+  if (!state.demo) {
+    try { payload = await api('GET', `/api/tenants/${state.slug}/workflows/${wfId}/default-payload`); } catch (_) {}
+  }
+  openModal(`Trigger ${wfId}: ${meta?.name || wfId}`,
+    `<p class="text-sm text-muted mb-16">Edit the payload then click Run. In demo mode this is simulated.</p>
+     <div class="form-group"><label>Payload (JSON)</label><textarea id="trigger-payload" rows="6">${JSON.stringify(payload, null, 2)}</textarea></div>`,
+    `<button class="btn btn-ghost" onclick="closeModal()">Cancel</button>
+     <button class="btn btn-primary" onclick="doTrigger('${wfId}')">▶ Run workflow</button>`
+  );
+};
+
+window.doTrigger = async function(wfId) {
+  let payload = {};
+  try { payload = JSON.parse(document.getElementById('trigger-payload').value); } catch (_) {}
+  closeModal();
+  try {
+    await api('POST', `/api/tenants/${state.slug}/workflows/${wfId}/trigger`, { payload });
+    toast(`${wfId} triggered successfully`, 'success');
+  } catch (e) { toast(e.message, 'error'); }
+};
+
+// ═══════════════════════════════════════════════════
+// VIEW: ANALYTICS
+// ═══════════════════════════════════════════════════
+async function viewAnalytics(el) {
+  el.innerHTML = `
+    <div class="view-header"><div class="view-title">Analytics</div></div>
+    <div class="tab-bar">
+      <button class="tab-btn active" onclick="switchTab('tab-overview', this)">Overview</button>
+      <button class="tab-btn" onclick="switchTab('tab-revenue', this)">Revenue Attribution</button>
+      <button class="tab-btn" onclick="switchTab('tab-cohort', this)">Cohort Retention</button>
+      <button class="tab-btn" onclick="switchTab('tab-email', this)">Email Performance</button>
+    </div>
+    <div id="tab-overview" class="tab-pane active"><div class="skeleton skel-h80 skel-mb8"></div><div class="skeleton skel-h80"></div></div>
+    <div id="tab-revenue"  class="tab-pane"></div>
+    <div id="tab-cohort"   class="tab-pane"></div>
+    <div id="tab-email"    class="tab-pane"></div>
+  `;
+  loadAnalyticsTab('tab-overview');
+}
+
+window.switchTab = function(tabId, btn) {
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+  document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
+  btn.classList.add('active');
+  document.getElementById(tabId).classList.add('active');
+  loadAnalyticsTab(tabId);
+};
+
+async function loadAnalyticsTab(tabId) {
+  const pane = document.getElementById(tabId);
+  if (!pane || pane.dataset.loaded) return;
+  pane.dataset.loaded = '1';
+
+  if (tabId === 'tab-overview') {
+    const data = await api('GET', `/api/tenants/${state.slug}/analytics`);
+    const leads  = data.leads  || [];
+    const carts  = data.carts  || [];
+    const loyalty= data.loyalty|| [];
+    const tickets= data.tickets|| [];
+    const byDay = {};
+    leads.forEach(l => {
+      const d = l.created_at?.slice(0,10) || 'unknown';
+      byDay[d] = (byDay[d] || 0) + 1;
+    });
+    const days = Object.keys(byDay).sort().slice(-14);
+    const maxLeads = Math.max(...days.map(d => byDay[d]), 1);
+    pane.innerHTML = `
+      <div class="stats-grid" style="grid-template-columns:repeat(3,1fr)">
+        <div class="stat-card"><div class="stat-value">${leads.length}</div><div class="stat-label">Total leads</div></div>
+        <div class="stat-card green"><div class="stat-value">${leads.filter(l=>l.category==='hot').length}</div><div class="stat-label">Hot leads</div></div>
+        <div class="stat-card"><div class="stat-value">${leads.filter(l=>l.category==='warm').length}</div><div class="stat-label">Warm leads</div></div>
+        <div class="stat-card"><div class="stat-value">${carts.filter(c=>c.status==='recovered').length}</div><div class="stat-label">Carts recovered</div></div>
+        <div class="stat-card amber"><div class="stat-value">£${carts.filter(c=>c.status==='recovered').reduce((s,c)=>s+(c.recovery_value||0),0).toLocaleString('en-GB',{maximumFractionDigits:0})}</div><div class="stat-label">Recovery revenue</div></div>
+        <div class="stat-card violet"><div class="stat-value">${loyalty.reduce((s,l)=>s+(l.points||0),0).toLocaleString()}</div><div class="stat-label">Loyalty points</div></div>
+      </div>
+      <div class="card">
+        <div class="card-header"><span class="card-title">Lead volume — last 14 days</span></div>
+        <div style="display:flex;align-items:flex-end;gap:4px;height:80px;padding-top:8px">
+          ${days.map(d => `
+            <div style="flex:1;display:flex;flex-direction:column;align-items:center;gap:4px">
+              <div style="width:100%;background:var(--accent);opacity:.8;border-radius:3px 3px 0 0;height:${Math.round((byDay[d]/maxLeads)*64)}px"></div>
+              <span style="font-size:.6rem;color:var(--text-3);transform:rotate(-45deg);transform-origin:top right;white-space:nowrap">${d.slice(5)}</span>
+            </div>
+          `).join('')}
+        </div>
+      </div>
+    `;
+  }
+
+  if (tabId === 'tab-revenue') {
+    const data = await api('GET', `/api/tenants/${state.slug}/revenue-attribution`);
+    const maxVal = Math.max(...data.map(d => d.total), 1);
+    pane.innerHTML = `
+      <div class="card">
+        <div class="card-header"><span class="card-title">Revenue by workflow (last 30 days)</span></div>
+        <div class="attr-list">
+          ${data.length === 0
+            ? '<div class="empty-state"><div class="empty-state-icon">💰</div><h3>No attribution data yet</h3><p>Revenue attribution appears when workflows generate sales</p></div>'
+            : data.map(r => `
+                <div class="attr-row">
+                  <div class="attr-label">${r.workflow_id}</div>
+                  <div class="attr-bar-wrap"><div class="attr-bar" style="width:${Math.round((r.total/maxVal)*100)}%"></div></div>
+                  <div class="attr-val">£${r.total.toLocaleString('en-GB',{maximumFractionDigits:0})}</div>
+                </div>
+              `).join('')
+          }
+        </div>
+      </div>
+    `;
+  }
+
+  if (tabId === 'tab-cohort') {
+    const data = await api('GET', `/api/tenants/${state.slug}/cohorts`);
+    if (!data.length) {
+      pane.innerHTML = '<div class="empty-state"><div class="empty-state-icon">📊</div><h3>No cohort data yet</h3><p>Cohort data builds up after customer repeat purchases</p></div>';
       return;
     }
+    const maxMonths = Math.max(...data.map(c => c.retention.length));
+    const headers = ['Cohort','Size',...Array.from({length:maxMonths},(_,i)=>`M+${i+1}`)];
+    pane.innerHTML = `
+      <div class="card">
+        <div class="card-header"><span class="card-title">Cohort retention heatmap</span><span class="text-xs text-muted">% of cohort still purchasing</span></div>
+        <div class="cohort-table">
+          <table>
+            <thead><tr>${headers.map(h=>`<th>${h}</th>`).join('')}</tr></thead>
+            <tbody>
+              ${data.map(c => `
+                <tr>
+                  <td class="cohort-label">${c.cohort}</td>
+                  <td>${c.size}</td>
+                  ${c.retention.map(pct => `
+                    <td class="cohort-cell" style="background:rgba(56,189,248,${(pct/100)*0.8});color:${pct>50?'#0f172a':'var(--text-1)'}">${pct}%</td>
+                  `).join('')}
+                  ${Array.from({length: maxMonths - c.retention.length}, () => '<td></td>').join('')}
+                </tr>
+              `).join('')}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    `;
+  }
 
-    errEl.classList.add('hidden');
-    btn.disabled = true;
-    if (labelEl) labelEl.classList.add('hidden');
-    if (spinEl)  spinEl.classList.remove('hidden');
+  if (tabId === 'tab-email') {
+    const data = await api('GET', `/api/tenants/${state.slug}/email-stats`);
+    const s = data.summary || {};
+    pane.innerHTML = `
+      <div class="email-stats-row">
+        <div class="stat-card"><div class="stat-value">${(s.sent||0).toLocaleString()}</div><div class="stat-label">Emails delivered</div></div>
+        <div class="stat-card green"><div class="stat-value">${s.open_rate||0}%</div><div class="stat-label">Open rate</div></div>
+        <div class="stat-card"><div class="stat-value">${s.click_rate||0}%</div><div class="stat-label">Click rate</div></div>
+        <div class="stat-card amber"><div class="stat-value">${s.reply_rate||0}%</div><div class="stat-label">Reply rate</div></div>
+      </div>
+      <div class="card">
+        <div class="card-header"><span class="card-title">Performance by workflow</span></div>
+        <table class="log-table">
+          <thead><tr><th>Workflow</th><th>Sent</th><th>Opened</th><th>Clicked</th><th>Open rate</th></tr></thead>
+          <tbody>
+            ${(data.by_workflow||[]).map(w => `
+              <tr>
+                <td>${w.workflow_id}</td>
+                <td>${w.sent.toLocaleString()}</td>
+                <td>${w.opened.toLocaleString()}</td>
+                <td>${(w.clicked||0).toLocaleString()}</td>
+                <td><span class="pill ${w.open_rate>40?'pill-active':'pill-info'}">${w.open_rate}%</span></td>
+              </tr>
+            `).join('') || '<tr><td colspan="5" class="text-muted" style="text-align:center;padding:20px">No email events yet</td></tr>'}
+          </tbody>
+        </table>
+      </div>
+    `;
+  }
+}
 
+// ═══════════════════════════════════════════════════
+// VIEW: LOGS
+// ═══════════════════════════════════════════════════
+async function viewLogs(el) {
+  const logs = await api('GET', `/api/tenants/${state.slug}/logs?limit=50`);
+  el.innerHTML = `
+    <div class="view-header">
+      <div><div class="view-title">Execution Logs</div><div class="view-sub">Last 50 workflow runs</div></div>
+    </div>
+    <div class="card" style="padding:0;overflow:hidden">
+      <table class="log-table">
+        <thead><tr><th>Time</th><th>Workflow</th><th>Status</th><th>Duration</th><th>Input</th><th>Output / Error</th></tr></thead>
+        <tbody>
+          ${logs.length === 0
+            ? '<tr><td colspan="6" class="text-muted" style="text-align:center;padding:28px">No logs yet</td></tr>'
+            : logs.map(l => `
+                <tr>
+                  <td class="log-duration">${new Date(l.executed_at).toLocaleTimeString()}</td>
+                  <td><span class="fw-600">${l.workflow_id}</span></td>
+                  <td><span class="status-badge ${l.status}">${l.status}</span></td>
+                  <td class="log-duration">${l.duration_ms ? l.duration_ms + 'ms' : '—'}</td>
+                  <td class="log-input">${l.input_summary || '—'}</td>
+                  <td class="log-output" style="color:${l.status==='failed'?'var(--red)':''}">
+                    ${l.status === 'failed' ? l.error_message || 'Error' : l.output_summary || '—'}
+                  </td>
+                </tr>
+              `).join('')}
+        </tbody>
+      </table>
+    </div>
+  `;
+}
+
+// ═══════════════════════════════════════════════════
+// VIEW: CONTENT CALENDAR
+// ═══════════════════════════════════════════════════
+async function viewContent(el) {
+  const items = await api('GET', `/api/tenants/${state.slug}/content`);
+  const byStatus = { draft: [], scheduled: [], published: [] };
+  items.forEach(i => { (byStatus[i.status] || byStatus.draft).push(i); });
+
+  const platformTag = (p) => `<span class="tag">${p}</span>`;
+  const typeTag = (t) => `<span class="tag">${t}</span>`;
+
+  el.innerHTML = `
+    <div class="view-header">
+      <div><div class="view-title">Content Calendar</div><div class="view-sub">AI-generated content pipeline</div></div>
+      <button class="btn btn-primary btn-sm" onclick="openNewContentModal()">+ New item</button>
+    </div>
+    <div class="kanban">
+      ${['draft','scheduled','published'].map(status => `
+        <div class="kanban-col">
+          <div class="kanban-col-header">
+            <span>${status.charAt(0).toUpperCase()+status.slice(1)}</span>
+            <span>${byStatus[status].length}</span>
+          </div>
+          <div class="kanban-items">
+            ${byStatus[status].map(item => `
+              <div class="kanban-card">
+                <div class="kanban-card-title">${item.title}</div>
+                <div class="kanban-card-meta">${item.keyword ? '🔑 ' + item.keyword : ''}</div>
+                <div class="kanban-card-tags">
+                  ${platformTag(item.platform)}
+                  ${typeTag(item.type)}
+                  ${item.scheduled_at ? `<span class="tag">📅 ${new Date(item.scheduled_at).toLocaleDateString()}</span>` : ''}
+                </div>
+              </div>
+            `).join('') || '<div class="text-muted text-sm" style="padding:8px 0">Nothing here</div>'}
+          </div>
+        </div>
+      `).join('')}
+    </div>
+  `;
+}
+
+window.openNewContentModal = function() {
+  openModal('New content item',
+    `<div class="form-group"><label>Title *</label><input id="ct-title" type="text" placeholder="Spring Skincare Guide 2026"/></div>
+     <div class="form-grid-2">
+       <div class="form-group"><label>Type</label><select id="ct-type"><option>blog</option><option>email</option><option>social</option><option>ugc</option></select></div>
+       <div class="form-group"><label>Platform</label><select id="ct-platform"><option>Website</option><option>Brevo</option><option>Instagram</option><option>TikTok</option><option>LinkedIn</option></select></div>
+       <div class="form-group"><label>Keyword</label><input id="ct-keyword" type="text" placeholder="spring skincare"/></div>
+       <div class="form-group"><label>Schedule date</label><input id="ct-sched" type="datetime-local"/></div>
+     </div>`,
+    `<button class="btn btn-ghost" onclick="closeModal()">Cancel</button>
+     <button class="btn btn-primary" onclick="doCreateContent()">Create</button>`
+  );
+};
+
+window.doCreateContent = async function() {
+  const title = document.getElementById('ct-title').value.trim();
+  if (!title) { toast('Title is required', 'error'); return; }
+  const body = {
+    title,
+    type:         document.getElementById('ct-type').value,
+    platform:     document.getElementById('ct-platform').value,
+    keyword:      document.getElementById('ct-keyword').value,
+    scheduled_at: document.getElementById('ct-sched').value || null,
+    status: 'draft',
+  };
+  try {
+    await api('POST', `/api/tenants/${state.slug}/content`, body);
+    closeModal();
+    toast('Content item created', 'success');
+    navTo('content');
+  } catch (e) { toast(e.message, 'error'); }
+};
+
+// ═══════════════════════════════════════════════════
+// VIEW: A/B TESTS
+// ═══════════════════════════════════════════════════
+async function viewAbTests(el) {
+  const tests = await api('GET', `/api/tenants/${state.slug}/ab-tests`);
+
+  el.innerHTML = `
+    <div class="view-header">
+      <div><div class="view-title">A/B Tests</div><div class="view-sub">Optimise your workflow messaging with data</div></div>
+      <button class="btn btn-primary btn-sm" onclick="openNewAbModal()">+ New test</button>
+    </div>
+    <div class="ab-grid">
+      ${tests.length === 0
+        ? `<div class="empty-state" style="grid-column:1/-1"><div class="empty-state-icon">🧪</div><h3>No A/B tests yet</h3><p>Create your first test to optimise workflow performance</p></div>`
+        : tests.map(t => {
+            const aRate = t.a_sent > 0 ? Math.round((t.a_opened / t.a_sent) * 100) : 0;
+            const bRate = t.b_sent > 0 ? Math.round((t.b_opened / t.b_sent) * 100) : 0;
+            const maxRate = Math.max(aRate, bRate, 1);
+            return `
+              <div class="ab-card">
+                <div class="ab-card-header">
+                  <div>
+                    <div class="ab-card-name">${t.name}</div>
+                    <div class="ab-card-wf">${t.workflow_id}</div>
+                  </div>
+                  <span class="pill ${t.status==='running'?'pill-amber':(t.status==='completed'?'pill-active':'pill-inactive')}">${t.status}</span>
+                </div>
+                <div class="ab-variants">
+                  <div class="ab-variant">
+                    <div class="ab-variant-label">Variant A ${t.winner==='A'?'🏆':''}</div>
+                    <div class="ab-variant-text">${t.variant_a}</div>
+                    <div class="ab-bar-wrap"><div class="ab-bar a" style="width:${Math.round((aRate/maxRate)*100)}%"></div></div>
+                    <div class="ab-stat">${t.a_sent||0} sent · ${aRate}% open</div>
+                  </div>
+                  <div class="ab-variant">
+                    <div class="ab-variant-label">Variant B ${t.winner==='B'?'🏆':''}</div>
+                    <div class="ab-variant-text">${t.variant_b}</div>
+                    <div class="ab-bar-wrap"><div class="ab-bar b" style="width:${Math.round((bRate/maxRate)*100)}%"></div></div>
+                    <div class="ab-stat">${t.b_sent||0} sent · ${bRate}% open</div>
+                  </div>
+                </div>
+                ${t.status === 'running' ? `
+                  <div style="display:flex;gap:6px">
+                    <button class="btn btn-sm btn-ghost w-full" onclick="declareWinner('${t.id}','A')">A wins</button>
+                    <button class="btn btn-sm btn-ghost w-full" onclick="declareWinner('${t.id}','B')">B wins</button>
+                  </div>
+                ` : ''}
+              </div>
+            `;
+          }).join('')
+      }
+    </div>
+  `;
+}
+
+window.openNewAbModal = function() {
+  openModal('New A/B Test',
+    `<div class="form-group"><label>Test name *</label><input id="ab-name" type="text" placeholder="Cart Recovery Subject Lines"/></div>
+     <div class="form-group"><label>Workflow ID *</label><input id="ab-wf" type="text" placeholder="C-01"/></div>
+     <div class="form-group"><label>Variant A *</label><input id="ab-a" type="text" placeholder="You left something behind 🛒"/></div>
+     <div class="form-group"><label>Variant B *</label><input id="ab-b" type="text" placeholder="Your cart misses you — 10% off inside"/></div>`,
+    `<button class="btn btn-ghost" onclick="closeModal()">Cancel</button>
+     <button class="btn btn-primary" onclick="doCreateAb()">Create test</button>`
+  );
+};
+
+window.doCreateAb = async function() {
+  const name = document.getElementById('ab-name').value.trim();
+  const wf   = document.getElementById('ab-wf').value.trim();
+  const a    = document.getElementById('ab-a').value.trim();
+  const b    = document.getElementById('ab-b').value.trim();
+  if (!name || !wf || !a || !b) { toast('All fields required', 'error'); return; }
+  try {
+    await api('POST', `/api/tenants/${state.slug}/ab-tests`, { name, workflow_id: wf, variant_a: a, variant_b: b });
+    closeModal();
+    toast('A/B test created', 'success');
+    navTo('ab-tests');
+  } catch (e) { toast(e.message, 'error'); }
+};
+
+window.declareWinner = async function(testId, winner) {
+  try {
+    await api('PATCH', `/api/tenants/${state.slug}/ab-tests/${testId}`, { winner });
+    toast(`Variant ${winner} declared winner`, 'success');
+    navTo('ab-tests');
+  } catch (e) { toast(e.message, 'error'); }
+};
+
+// ═══════════════════════════════════════════════════
+// VIEW: KNOWLEDGE BASE
+// ═══════════════════════════════════════════════════
+async function viewKnowledge(el) {
+  const docs = await api('GET', `/api/tenants/${state.slug}/rag-docs`);
+  const fmt  = (bytes) => bytes > 1e6 ? (bytes/1e6).toFixed(1)+'MB' : (bytes/1e3).toFixed(0)+'KB';
+
+  el.innerHTML = `
+    <div class="view-header">
+      <div><div class="view-title">Knowledge Base</div><div class="view-sub">Documents powering your RAG Brain (S-02)</div></div>
+    </div>
+    <div class="rag-dropzone" id="rag-drop" onclick="document.getElementById('rag-file').click()">
+      <div class="rag-dropzone-icon">📄</div>
+      <div class="rag-dropzone-text">Drop files here or click to upload</div>
+      <div class="rag-dropzone-sub">PDF, DOCX, TXT — max 50MB per file</div>
+      <input id="rag-file" type="file" accept=".pdf,.docx,.txt" style="display:none" multiple onchange="handleRagUpload(event)"/>
+    </div>
+    <div class="rag-list">
+      ${docs.length === 0
+        ? '<div class="empty-state"><div class="empty-state-icon">🧠</div><h3>No documents yet</h3><p>Upload product manuals, FAQs, or guides</p></div>'
+        : docs.map(d => `
+            <div class="rag-item">
+              <div class="rag-item-icon">${d.name.endsWith('.pdf') ? '📕' : d.name.endsWith('.docx') ? '📘' : '📄'}</div>
+              <div class="rag-item-info">
+                <div class="rag-item-name">${d.name}</div>
+                <div class="rag-item-meta">${fmt(d.size_bytes)} · ${d.chunk_count || '?'} chunks · ${new Date(d.uploaded_at).toLocaleDateString()}</div>
+              </div>
+              <div class="rag-item-status">
+                <span class="pill ${d.status==='indexed'?'pill-active':'pill-amber'}">${d.status}</span>
+              </div>
+              <button class="btn btn-danger btn-xs" onclick="deleteRagDoc('${d.id}','${d.name}')">Delete</button>
+            </div>
+          `).join('')}
+    </div>
+  `;
+
+  // Drag-and-drop
+  const dz = document.getElementById('rag-drop');
+  dz.addEventListener('dragover', e => { e.preventDefault(); dz.classList.add('dragover'); });
+  dz.addEventListener('dragleave', () => dz.classList.remove('dragover'));
+  dz.addEventListener('drop', e => { e.preventDefault(); dz.classList.remove('dragover'); handleRagUpload({ target: { files: e.dataTransfer.files } }); });
+}
+
+window.handleRagUpload = async function(evt) {
+  const files = Array.from(evt.target.files || []);
+  for (const file of files) {
     try {
-      await connect(slugVal, keyVal);
-    } catch (err) {
-      var msg = err.message;
-      if (msg.indexOf('404') !== -1) msg = 'Workspace not found. Check your slug.';
-      else if (msg.indexOf('401') !== -1) msg = 'Invalid access key.';
-      else msg = 'Connection failed: ' + msg;
-      errEl.textContent = msg;
-      errEl.classList.remove('hidden');
+      await api('POST', `/api/tenants/${state.slug}/rag-docs`, { name: file.name, size_bytes: file.size });
+      toast(`${file.name} uploaded — indexing in progress`, 'success');
+    } catch (e) { toast(e.message, 'error'); }
+  }
+  navTo('knowledge');
+};
+
+window.deleteRagDoc = async function(docId, name) {
+  if (!confirm(`Delete "${name}"? This cannot be undone.`)) return;
+  try {
+    await api('DELETE', `/api/tenants/${state.slug}/rag-docs/${docId}`);
+    toast('Document deleted', 'success');
+    navTo('knowledge');
+  } catch (e) { toast(e.message, 'error'); }
+};
+
+// ═══════════════════════════════════════════════════
+// VIEW: INTEGRATIONS
+// ═══════════════════════════════════════════════════
+async function viewIntegrations(el) {
+  const ints = await api('GET', `/api/tenants/${state.slug}/integrations`);
+  const connected = ints.filter(i => i.connected).length;
+  el.innerHTML = `
+    <div class="view-header">
+      <div><div class="view-title">Integrations</div><div class="view-sub">${connected}/${ints.length} connected</div></div>
+      <button class="btn btn-ghost btn-sm" onclick="openShopifyOauth()">+ Connect Shopify</button>
+    </div>
+    <div class="int-grid">
+      ${ints.map(i => `
+        <div class="int-card">
+          <div class="int-card-header">
+            <span class="int-label">${i.label}</span>
+            <span class="int-dot ${i.connected ? 'ok' : 'err'}"></span>
+          </div>
+          <div class="int-env">${i.env_var}</div>
+          <div class="int-wfs">Used by: ${Array.isArray(i.workflows) ? i.workflows.slice(0,3).join(', ')+(i.workflows.length>3?'…':'') : i.workflows}</div>
+          ${!i.connected ? `<div style="margin-top:8px"><span class="pill pill-error">Not configured</span></div>` : ''}
+        </div>
+      `).join('')}
+    </div>
+  `;
+}
+
+window.openShopifyOauth = function() {
+  const slug = state.slug;
+  const shop = state.config?.store_url?.replace('https://','').replace('/','') || '';
+  openModal('Connect Shopify',
+    `<p class="text-sm text-muted mb-16">Enter your Shopify store domain to begin the OAuth flow.</p>
+     <div class="form-group"><label>Shop domain</label><input id="shopify-domain" type="text" value="${shop}" placeholder="mystore.myshopify.com"/></div>`,
+    `<button class="btn btn-ghost" onclick="closeModal()">Cancel</button>
+     <button class="btn btn-primary" onclick="doShopifyOauth()">Connect →</button>`
+  );
+};
+
+window.doShopifyOauth = function() {
+  const shop = document.getElementById('shopify-domain').value.trim();
+  if (!shop) { toast('Enter your shop domain', 'error'); return; }
+  if (state.demo) { closeModal(); toast('Shopify OAuth flow would open here (demo mode)', 'info'); return; }
+  window.location.href = `/api/shopify/install?shop=${encodeURIComponent(shop)}&slug=${encodeURIComponent(state.slug)}`;
+};
+
+// ═══════════════════════════════════════════════════
+// VIEW: SETTINGS
+// ═══════════════════════════════════════════════════
+async function viewSettings(el) {
+  const cfg = state.config || {};
+  el.innerHTML = `
+    <div class="view-header">
+      <div><div class="view-title">Settings</div></div>
+      <button class="btn btn-primary btn-sm" onclick="saveSettings()">Save changes</button>
+    </div>
+    <div class="card">
+      <div class="card-title mb-16">Brand</div>
+      <div class="settings-grid">
+        <div class="form-group"><label>Brand name</label><input id="s-brand" type="text" value="${cfg.brand_name||''}"/></div>
+        <div class="form-group"><label>Store URL</label><input id="s-url" type="text" value="${cfg.store_url||''}"/></div>
+        <div class="form-group"><label>Brand voice</label><input id="s-voice" type="text" value="${cfg.brand_voice||''}"/></div>
+        <div class="form-group"><label>Calendly URL</label><input id="s-cal" type="text" value="${cfg.calendly_url||''}"/></div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-title mb-16">Contact emails</div>
+      <div class="settings-grid">
+        <div class="form-group"><label>Strategy email</label><input id="s-strat" type="email" value="${cfg.strategy_email||''}"/></div>
+        <div class="form-group"><label>Ops email</label><input id="s-ops" type="email" value="${cfg.ops_email||''}"/></div>
+        <div class="form-group"><label>CEO phone</label><input id="s-ceo" type="text" value="${cfg.ceo_phone||''}"/></div>
+        <div class="form-group"><label>Support email</label><input id="s-sup" type="email" value="${cfg.support_email||''}"/></div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-title mb-16">Thresholds</div>
+      <div class="settings-grid">
+        <div class="form-group"><label>Hot lead score</label><input id="s-lscore" type="number" value="${cfg.lead_hot_score_threshold||80}"/></div>
+        <div class="form-group"><label>Churn risk threshold</label><input id="s-churn" type="number" value="${cfg.churn_risk_threshold||60}"/></div>
+        <div class="form-group"><label>Free shipping (£)</label><input id="s-ship" type="number" value="${cfg.free_shipping_threshold||50}"/></div>
+        <div class="form-group"><label>ROAS alert</label><input id="s-roas" type="number" value="${cfg.roas_alert_threshold||1.5}"/></div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-title mb-16">Billing</div>
+      <div style="display:flex;align-items:center;gap:16px">
+        <div>
+          <span class="fw-600">Current plan: </span>
+          <span class="pill ${cfg.plan==='scale'?'pill-scale':cfg.plan==='enterprise'?'pill-enterprise':'pill-growth'}">${(cfg.plan||'growth').toUpperCase()}</span>
+        </div>
+        <button class="btn btn-ghost btn-sm" onclick="openBillingPortal()">Manage billing →</button>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-title mb-16">Client portal</div>
+      <p class="text-sm text-muted mb-16">Generate a read-only access token to share your dashboard with clients.</p>
+      <button class="btn btn-ghost btn-sm" onclick="generateClientToken()">Generate client access token</button>
+      <div id="client-token-result" style="margin-top:12px"></div>
+    </div>
+  `;
+}
+
+window.saveSettings = async function() {
+  const body = {
+    brand_name:                document.getElementById('s-brand')?.value,
+    store_url:                 document.getElementById('s-url')?.value,
+    brand_voice:               document.getElementById('s-voice')?.value,
+    calendly_url:              document.getElementById('s-cal')?.value,
+    strategy_email:            document.getElementById('s-strat')?.value,
+    ops_email:                 document.getElementById('s-ops')?.value,
+    ceo_phone:                 document.getElementById('s-ceo')?.value,
+    support_email:             document.getElementById('s-sup')?.value,
+    lead_hot_score_threshold:  +document.getElementById('s-lscore')?.value || undefined,
+    churn_risk_threshold:      +document.getElementById('s-churn')?.value || undefined,
+    free_shipping_threshold:   +document.getElementById('s-ship')?.value  || undefined,
+    roas_alert_threshold:      +document.getElementById('s-roas')?.value  || undefined,
+  };
+  try {
+    const updated = await api('PUT', `/api/tenants/${state.slug}/config`, body);
+    state.config = { ...state.config, ...updated };
+    toast('Settings saved', 'success');
+  } catch (e) { toast(e.message, 'error'); }
+};
+
+window.generateClientToken = async function() {
+  try {
+    const r = await api('POST', `/api/tenants/${state.slug}/client-access`);
+    const link = `${window.location.origin}#client-token=${r.token}`;
+    document.getElementById('client-token-result').innerHTML = `
+      <div class="alert alert-info">
+        <strong>Token generated (valid 30 days)</strong><br/>
+        <small style="word-break:break-all">${r.token}</small><br/>
+        <button class="btn btn-xs btn-ghost mt-8" onclick="navigator.clipboard.writeText('${r.token}').then(()=>toast('Copied!','success'))">Copy token</button>
+      </div>
+    `;
+  } catch (e) { toast(e.message, 'error'); }
+};
+
+window.openBillingPortal = async function() {
+  if (state.demo) { toast('Billing portal would open here (demo mode)', 'info'); return; }
+  try {
+    const r = await fetch('/api/billing/portal-session', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': state.key },
+      body: JSON.stringify({ slug: state.slug }),
+    });
+    const data = await r.json();
+    if (data.url) window.open(data.url, '_blank');
+  } catch (e) { toast('Could not open billing portal', 'error'); }
+};
+
+// ═══════════════════════════════════════════════════
+// MONTHLY REPORT
+// ═══════════════════════════════════════════════════
+window.openReport = function() {
+  const month = new Date().toISOString().slice(0, 7);
+  if (state.demo) {
+    toast('Monthly report would open as a printable HTML page (demo mode)', 'info');
+    return;
+  }
+  window.open(`/api/tenants/${state.slug}/reports/monthly?month=${month}&x-api-key=${encodeURIComponent(state.key)}`, '_blank');
+};
+
+// ═══════════════════════════════════════════════════
+// CLIENT PORTAL
+// ═══════════════════════════════════════════════════
+async function enterClientPortal(token) {
+  try {
+    const r = await fetch(`/api/client/${token}/overview`);
+    if (!r.ok) throw new Error('Invalid or expired token');
+    const data = await r.json();
+    document.getElementById('client-brand-name').textContent = data.brand_name || 'Your Brand';
+    document.getElementById('client-dash-content').innerHTML = `
+      <div class="stats-grid">
+        <div class="stat-card"><div class="stat-value">${data.active_workflows}<span style="font-size:1rem;color:var(--text-3)">/24</span></div><div class="stat-label">Active workflows</div></div>
+        <div class="stat-card green"><div class="stat-value">${data.hot_leads}</div><div class="stat-label">Hot leads this month</div></div>
+        <div class="stat-card"><div class="stat-value">${data.carts_recovered}</div><div class="stat-label">Carts recovered</div></div>
+        <div class="stat-card violet"><div class="stat-value">${(data.loyalty_points||0).toLocaleString()}</div><div class="stat-label">Loyalty points issued</div></div>
+      </div>
+      <div class="alert alert-info mt-16">This is a read-only client view. Contact your agency for full access.</div>
+    `;
+    showScreen('screen-client-dash');
+  } catch (e) {
+    document.getElementById('client-error').textContent = e.message;
+    document.getElementById('client-error').style.display = 'block';
+  }
+}
+
+// ═══════════════════════════════════════════════════
+// AGENCY PORTAL
+// ═══════════════════════════════════════════════════
+async function enterAgencyPortal(key) {
+  try {
+    const r = await fetch('/api/agency/tenants', { headers: { 'x-agency-key': key } });
+    if (!r.ok) throw new Error('Invalid agency key');
+    const tenants = await r.json();
+    state.agencyKey = key;
+    renderAgencyDash(tenants);
+    showScreen('screen-agency-dash');
+  } catch (e) {
+    document.getElementById('agency-error').textContent = e.message;
+    document.getElementById('agency-error').style.display = 'block';
+  }
+}
+
+function renderAgencyDash(tenants) {
+  const grid = document.getElementById('agency-tenants-grid');
+  if (!tenants.length) {
+    grid.innerHTML = '<div class="empty-state"><div class="empty-state-icon">🏢</div><h3>No tenants yet</h3><p>Create your first client tenant to get started</p></div>';
+    return;
+  }
+  grid.innerHTML = tenants.map(t => `
+    <div class="agency-card">
+      <div class="agency-card-header">
+        <div>
+          <div class="agency-card-name">${t.name}</div>
+          <div class="agency-card-slug">/${t.slug}</div>
+        </div>
+        <span class="pill ${t.plan==='scale'?'pill-scale':t.plan==='enterprise'?'pill-enterprise':'pill-growth'}">${(t.plan||'growth').toUpperCase()}</span>
+      </div>
+      <div class="agency-card-stats">
+        <div class="agency-stat"><div class="agency-stat-val">${t.active_workflows||0}</div><div class="agency-stat-lbl">Active WFs</div></div>
+        <div class="agency-stat"><div class="agency-stat-val">${t.lead_count||0}</div><div class="agency-stat-lbl">Leads</div></div>
+        <div class="agency-stat"><div class="agency-stat-val">${t.cart_recoveries||0}</div><div class="agency-stat-lbl">Recovered</div></div>
+      </div>
+      <div class="agency-card-footer">
+        <span class="text-xs text-muted">Last activity: ${t.last_activity ? new Date(t.last_activity).toLocaleDateString() : 'Never'}</span>
+      </div>
+    </div>
+  `).join('');
+}
+
+window.openNewTenantModal = function() {
+  openModal('New tenant',
+    `<div class="form-group"><label>Brand name *</label><input id="nt-brand" type="text" placeholder="Luna Cosmetics"/></div>
+     <div class="form-group"><label>Slug *</label><input id="nt-slug" type="text" placeholder="luna-cosmetics"/></div>
+     <div class="form-group"><label>Plan</label><select id="nt-plan"><option value="growth">Growth</option><option value="scale">Scale</option><option value="enterprise">Enterprise</option></select></div>`,
+    `<button class="btn btn-ghost" onclick="closeModal()">Cancel</button>
+     <button class="btn btn-primary" onclick="doCreateTenant()">Create tenant</button>`
+  );
+};
+
+window.doCreateTenant = async function() {
+  const name = document.getElementById('nt-brand').value.trim();
+  const slug = document.getElementById('nt-slug').value.trim();
+  const plan = document.getElementById('nt-plan').value;
+  if (!name || !slug) { toast('Name and slug required', 'error'); return; }
+  try {
+    await fetch('/api/agency/tenants', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-agency-key': state.agencyKey },
+      body: JSON.stringify({ name, slug, plan }),
+    });
+    closeModal();
+    toast('Tenant created', 'success');
+    // Refresh
+    const r = await fetch('/api/agency/tenants', { headers: { 'x-agency-key': state.agencyKey } });
+    renderAgencyDash(await r.json());
+  } catch (e) { toast(e.message, 'error'); }
+};
+
+// ═══════════════════════════════════════════════════
+// ONBOARDING
+// ═══════════════════════════════════════════════════
+let obStep = 1;
+const OB_STEPS = 4;
+
+function obNav(dir) {
+  const newStep = obStep + dir;
+  if (newStep < 1 || newStep > OB_STEPS) return;
+  document.getElementById(`onboard-section-${obStep}`).classList.remove('active');
+  document.querySelectorAll('.step').forEach(el => {
+    const s = +el.dataset.step;
+    el.classList.toggle('active', s === newStep);
+    el.classList.toggle('done', s < newStep);
+  });
+  obStep = newStep;
+  document.getElementById(`onboard-section-${obStep}`).classList.add('active');
+  document.getElementById('ob-back').style.display = obStep > 1 ? 'inline-flex' : 'none';
+  document.getElementById('ob-next').textContent = obStep === OB_STEPS ? 'Create tenant →' : 'Next →';
+}
+
+async function obSubmit() {
+  const brand = document.getElementById('ob-brand').value.trim();
+  const slug  = document.getElementById('ob-slug').value.trim();
+  if (!brand || !slug) {
+    document.getElementById('onboard-error').textContent = 'Brand name and slug are required';
+    document.getElementById('onboard-error').style.display = 'block';
+    return;
+  }
+  const payload = {
+    brand_name: brand,
+    slug,
+    plan:       document.getElementById('ob-plan').value,
+    store_url:  document.getElementById('ob-url').value,
+    strategy_email: document.getElementById('ob-strat').value,
+    ops_email:  document.getElementById('ob-ops').value,
+    ceo_phone:  document.getElementById('ob-ceo').value,
+    calendly_url: document.getElementById('ob-cal').value,
+    brand_voice: document.getElementById('ob-voice').value,
+    free_shipping_threshold: +document.getElementById('ob-ship').value || 50,
+    lead_hot_score_threshold: +document.getElementById('ob-lscore').value || 80,
+    churn_risk_threshold: +document.getElementById('ob-churn').value || 60,
+    slack_channel_leads: document.getElementById('ob-sl-leads').value,
+    slack_channel_hot_leads: document.getElementById('ob-sl-hot').value,
+    slack_channel_outreach: document.getElementById('ob-sl-out').value,
+    slack_channel_crm: document.getElementById('ob-sl-crm').value,
+    slack_channel_support: document.getElementById('ob-sl-sup').value,
+    slack_channel_revenue: document.getElementById('ob-sl-rev').value,
+  };
+  try {
+    const btn = document.getElementById('ob-next');
+    btn.disabled = true; btn.textContent = 'Creating…';
+    const result = await fetch('/api/onboard', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': state.key || document.getElementById('inp-key').value },
+      body: JSON.stringify(payload),
+    });
+    if (!result.ok) throw new Error((await result.json()).error || 'Onboard failed');
+    toast('Tenant created! Connecting…', 'success');
+    await connect(slug, state.key || document.getElementById('inp-key').value);
+    showScreen('screen-app');
+  } catch (e) {
+    document.getElementById('onboard-error').textContent = e.message;
+    document.getElementById('onboard-error').style.display = 'block';
+    document.getElementById('ob-next').disabled = false;
+    document.getElementById('ob-next').textContent = 'Create tenant →';
+  }
+}
+
+// ═══════════════════════════════════════════════════
+// EVENT LISTENERS — init
+// ═══════════════════════════════════════════════════
+document.addEventListener('DOMContentLoaded', () => {
+
+  // Check for client portal token in hash
+  const hash = window.location.hash;
+  if (hash.startsWith('#client-token=')) {
+    const token = hash.slice('#client-token='.length);
+    showScreen('screen-client');
+    document.getElementById('inp-client-token').value = token;
+    return;
+  }
+
+  // ── Connect screen ──
+  document.getElementById('btn-connect').addEventListener('click', async () => {
+    const slug = document.getElementById('inp-slug').value.trim();
+    const key  = document.getElementById('inp-key').value.trim();
+    const err  = document.getElementById('connect-error');
+    err.style.display = 'none';
+    if (!slug || !key) { err.textContent = 'Slug and API key are required'; err.style.display = 'block'; return; }
+    const btn = document.getElementById('btn-connect');
+    btn.disabled = true; btn.textContent = 'Connecting…';
+    try {
+      await connect(slug, key);
+    } catch (e) {
+      err.textContent = e.message.includes('404') ? 'Tenant not found — check your slug' : (e.message.includes('401') ? 'Invalid API key' : e.message);
+      err.style.display = 'block';
+      // If tenant not found, offer onboarding
+      if (e.message.includes('404')) {
+        err.innerHTML += '<br/><a href="#" onclick="startOnboard()">→ Create this tenant</a>';
+      }
     } finally {
-      btn.disabled = false;
-      if (labelEl) labelEl.classList.remove('hidden');
-      if (spinEl)  spinEl.classList.add('hidden');
+      btn.disabled = false; btn.textContent = 'Connect';
     }
   });
 
-  // Go to onboard screen
-  document.getElementById('btn-goto-onboard').addEventListener('click', function () {
-    showScreen('screen-onboard');
+  document.getElementById('inp-key').addEventListener('keydown', e => { if (e.key === 'Enter') document.getElementById('btn-connect').click(); });
+
+  document.getElementById('btn-demo').addEventListener('click', connectDemo);
+
+  document.getElementById('link-client').addEventListener('click', e => { e.preventDefault(); showScreen('screen-client'); });
+  document.getElementById('link-agency').addEventListener('click', e => { e.preventDefault(); showScreen('screen-agency'); });
+
+  document.getElementById('link-back-from-client').addEventListener('click', e => { e.preventDefault(); showScreen('screen-connect'); });
+  document.getElementById('link-back-from-agency').addEventListener('click', e => { e.preventDefault(); showScreen('screen-connect'); });
+
+  // ── Client portal login ──
+  document.getElementById('btn-client-login').addEventListener('click', async () => {
+    const token = document.getElementById('inp-client-token').value.trim();
+    if (!token) { document.getElementById('client-error').textContent = 'Token required'; document.getElementById('client-error').style.display = 'block'; return; }
+    await enterClientPortal(token);
   });
 
-  // Demo mode
-  document.getElementById('btn-demo').addEventListener('click', function () {
-    connectDemo();
+  // ── Agency portal login ──
+  document.getElementById('btn-agency-login').addEventListener('click', async () => {
+    const key = document.getElementById('inp-agency-key').value.trim();
+    if (!key) { document.getElementById('agency-error').textContent = 'API key required'; document.getElementById('agency-error').style.display = 'block'; return; }
+    await enterAgencyPortal(key);
   });
 
-  // Back to connect
-  document.getElementById('btn-back-connect').addEventListener('click', function () {
+  // ── App nav ──
+  document.querySelectorAll('.nav-item[data-view]').forEach(el => {
+    el.addEventListener('click', e => { e.preventDefault(); navTo(el.dataset.view); });
+  });
+
+  document.getElementById('btn-signout').addEventListener('click', signOut);
+  document.getElementById('btn-report').addEventListener('click', openReport);
+
+  // ── Onboarding ──
+  document.getElementById('ob-next').addEventListener('click', () => {
+    if (obStep === OB_STEPS) obSubmit();
+    else obNav(1);
+  });
+  document.getElementById('ob-back').addEventListener('click', () => obNav(-1));
+
+  // ── Agency portal new tenant ──
+  document.getElementById('btn-agency-new-tenant').addEventListener('click', openNewTenantModal);
+  document.getElementById('btn-agency-signout').addEventListener('click', () => {
+    state.agencyKey = null;
     showScreen('screen-connect');
   });
 
-  // Onboard form
-  document.getElementById('onboard-form').addEventListener('submit', function (e) {
-    e.preventDefault();
-    submitOnboard(e.target);
-  });
-
-  // New client button (from sidebar)
-  document.getElementById('btn-new-client').addEventListener('click', function () {
-    var form = document.getElementById('onboard-form');
-    var resultEl = document.getElementById('onboard-result');
-    form.reset();
-    form.classList.remove('hidden');
-    resultEl.classList.add('hidden');
-    resultEl.innerHTML = '';
-    showScreen('screen-onboard');
-  });
-
-  // Disconnect
-  document.getElementById('btn-disconnect').addEventListener('click', function () {
-    if (window.confirm('Disconnect from this workspace?')) disconnect();
-  });
+  // ── Modal close ──
+  document.getElementById('modal-close').addEventListener('click', closeModal);
+  document.getElementById('modal').addEventListener('click', e => { if (e.target.id === 'modal') closeModal(); });
 });
+
+// Expose for inline onclicks
+window.closeModal = closeModal;
+window.openReport = openReport;
+window.navTo = navTo;
+window.startOnboard = function() { showScreen('screen-onboard'); };

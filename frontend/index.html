@@ -1,303 +1,270 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
   <title>D2C AI Growth Suite</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="styles.css" />
+  <link rel="preconnect" href="https://fonts.googleapis.com"/>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet"/>
+  <link rel="stylesheet" href="styles.css"/>
 </head>
 <body>
 
-  <!-- CONNECT SCREEN -->
-  <div id="screen-connect" class="screen">
-    <div class="connect-wrap">
+<!-- ═══════════════════════════════════════════
+     SCREEN: CONNECT (login)
+════════════════════════════════════════════ -->
+<div id="screen-connect" class="screen active">
+  <div class="connect-wrap">
+    <div class="connect-logo">
+      <svg width="40" height="40" viewBox="0 0 40 40" fill="none"><rect width="40" height="40" rx="10" fill="#38bdf8"/><path d="M10 28L20 12l10 16H10z" fill="#0f172a"/></svg>
+      <span>D2C AI Growth Suite</span>
+    </div>
+    <h1 class="connect-title">Welcome back</h1>
+    <p class="connect-sub">Enter your tenant credentials to access the dashboard</p>
+    <div class="form-group">
+      <label>Tenant Slug</label>
+      <input id="inp-slug" type="text" placeholder="my-brand" autocomplete="off"/>
+    </div>
+    <div class="form-group">
+      <label>API Key</label>
+      <input id="inp-key" type="password" placeholder="sk-..."/>
+    </div>
+    <div id="connect-error" class="alert alert-error" style="display:none"></div>
+    <button id="btn-connect" class="btn btn-primary btn-full">Connect</button>
+    <div class="connect-divider"><span>or</span></div>
+    <button id="btn-demo" class="btn btn-ghost btn-full">Try demo mode (no auth required)</button>
+    <div class="connect-links">
+      <a href="#" id="link-client">Client portal login</a>
+      <span>·</span>
+      <a href="#" id="link-agency">Agency portal</a>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════
+     SCREEN: ONBOARD
+════════════════════════════════════════════ -->
+<div id="screen-onboard" class="screen">
+  <div class="onboard-wrap">
+    <div class="onboard-header">
       <div class="connect-logo">
-        <div class="logo-mark"></div>
-        <span class="logo-text">D2C AI</span>
+        <svg width="32" height="32" viewBox="0 0 40 40" fill="none"><rect width="40" height="40" rx="10" fill="#38bdf8"/><path d="M10 28L20 12l10 16H10z" fill="#0f172a"/></svg>
+        <span>D2C AI</span>
       </div>
-      <h1 class="connect-title">Growth Suite</h1>
-      <p class="connect-sub">Enter your workspace credentials to continue</p>
-      <form id="connect-form" class="connect-form" novalidate>
-        <div class="field-group">
-          <label class="field-label" for="inp-slug">Workspace Slug</label>
-          <input id="inp-slug" type="text" class="field-input" placeholder="e.g. acme-brand" autocomplete="off" spellcheck="false" />
-        </div>
-        <div class="field-group">
-          <label class="field-label" for="inp-key">Access Key</label>
-          <input id="inp-key" type="password" class="field-input" placeholder="Your API key" autocomplete="off" />
-        </div>
-        <button type="submit" id="connect-btn" class="btn btn-primary btn-full">
-          <span class="btn-label">Connect workspace</span>
-          <span class="btn-spinner hidden"></span>
-        </button>
-        <div id="connect-error" class="connect-error hidden"></div>
-      </form>
-      <div class="connect-divider"><span>or</span></div>
-      <button id="btn-demo" class="btn btn-outline btn-full btn-demo">Try demo mode (no auth)</button>
-      <button id="btn-goto-onboard" class="btn btn-ghost btn-full">Provision a new client workspace</button>
+      <div class="onboard-steps">
+        <span class="step active" data-step="1">1</span>
+        <span class="step-line"></span>
+        <span class="step" data-step="2">2</span>
+        <span class="step-line"></span>
+        <span class="step" data-step="3">3</span>
+        <span class="step-line"></span>
+        <span class="step" data-step="4">4</span>
+      </div>
     </div>
-  </div>
-
-  <!-- ONBOARD SCREEN -->
-  <div id="screen-onboard" class="screen hidden">
-    <div class="onboard-wrap">
-      <div class="onboard-header">
-        <button id="btn-back-connect" class="btn btn-ghost btn-sm">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="15 18 9 12 15 6"/></svg>
-          Back
-        </button>
-        <div class="onboard-title-block">
-          <h1>Provision New Client</h1>
-          <p class="text-3">Set up a new workspace and AI workflow suite</p>
+    <div id="onboard-section-1" class="onboard-section active">
+      <h2>Brand basics</h2>
+      <div class="form-grid-2">
+        <div class="form-group"><label>Brand name *</label><input id="ob-brand" type="text" placeholder="Luna Cosmetics"/></div>
+        <div class="form-group"><label>Store URL</label><input id="ob-url" type="text" placeholder="https://mystore.myshopify.com"/></div>
+        <div class="form-group"><label>Tenant slug *</label><input id="ob-slug" type="text" placeholder="luna-cosmetics"/></div>
+        <div class="form-group"><label>Plan</label>
+          <select id="ob-plan"><option value="growth">Growth — £297/mo</option><option value="scale">Scale — £597/mo</option><option value="enterprise">Enterprise — £1,497/mo</option></select>
         </div>
       </div>
-
-      <form id="onboard-form" novalidate>
-        <!-- Section 1 -->
-        <div class="onboard-section">
-          <div class="onboard-section-num">1</div>
-          <div class="onboard-section-body">
-            <h2 class="onboard-section-title">Workspace Identity</h2>
-            <div class="form-grid-2">
-              <div class="field-group">
-                <label class="field-label" for="ob-slug">Workspace Slug <span class="required">*</span></label>
-                <input id="ob-slug" type="text" class="field-input" placeholder="acme-brand" required />
-                <span class="field-hint">Lowercase, hyphens only. Cannot be changed later.</span>
-              </div>
-              <div class="field-group">
-                <label class="field-label" for="ob-name">Client Name <span class="required">*</span></label>
-                <input id="ob-name" type="text" class="field-input" placeholder="Acme Brand Co." required />
-              </div>
-              <div class="field-group">
-                <label class="field-label" for="ob-plan">Plan</label>
-                <select id="ob-plan" class="field-input field-select">
-                  <option value="growth">Growth</option>
-                  <option value="scale">Scale</option>
-                  <option value="enterprise">Enterprise</option>
-                </select>
-              </div>
-            </div>
-          </div>
-        </div>
-
-        <!-- Section 2 -->
-        <div class="onboard-section">
-          <div class="onboard-section-num">2</div>
-          <div class="onboard-section-body">
-            <h2 class="onboard-section-title">Brand &amp; Store</h2>
-            <div class="form-grid-2">
-              <div class="field-group">
-                <label class="field-label" for="ob-brand-name">Brand Name</label>
-                <input id="ob-brand-name" type="text" class="field-input" placeholder="Acme" />
-              </div>
-              <div class="field-group">
-                <label class="field-label" for="ob-store-url">Store URL</label>
-                <input id="ob-store-url" type="url" class="field-input" placeholder="https://acme.com" />
-              </div>
-              <div class="field-group">
-                <label class="field-label" for="ob-shopify-domain">Shopify Shop Domain</label>
-                <input id="ob-shopify-domain" type="text" class="field-input" placeholder="acme.myshopify.com" />
-              </div>
-              <div class="field-group">
-                <label class="field-label" for="ob-shopify-token">Shopify Access Token</label>
-                <input id="ob-shopify-token" type="password" class="field-input" placeholder="shpat_..." />
-              </div>
-              <div class="field-group">
-                <label class="field-label" for="ob-calendly">Calendly URL</label>
-                <input id="ob-calendly" type="url" class="field-input" placeholder="https://calendly.com/..." />
-              </div>
-              <div class="field-group">
-                <label class="field-label" for="ob-shipping">Free Shipping Threshold ($)</label>
-                <input id="ob-shipping" type="number" class="field-input" placeholder="50" min="0" />
-              </div>
-            </div>
-          </div>
-        </div>
-
-        <!-- Section 3 -->
-        <div class="onboard-section">
-          <div class="onboard-section-num">3</div>
-          <div class="onboard-section-body">
-            <h2 class="onboard-section-title">Contact Details</h2>
-            <div class="form-grid-2">
-              <div class="field-group">
-                <label class="field-label" for="ob-strategy-email">Strategy Email</label>
-                <input id="ob-strategy-email" type="email" class="field-input" placeholder="strategy@acme.com" />
-              </div>
-              <div class="field-group">
-                <label class="field-label" for="ob-ops-email">Ops Email</label>
-                <input id="ob-ops-email" type="email" class="field-input" placeholder="ops@acme.com" />
-              </div>
-              <div class="field-group">
-                <label class="field-label" for="ob-finance-email">Finance Email</label>
-                <input id="ob-finance-email" type="email" class="field-input" placeholder="finance@acme.com" />
-              </div>
-              <div class="field-group">
-                <label class="field-label" for="ob-ceo-phone">CEO Phone (WhatsApp)</label>
-                <input id="ob-ceo-phone" type="tel" class="field-input" placeholder="+1234567890" />
-              </div>
-            </div>
-          </div>
-        </div>
-
-        <!-- Section 4 -->
-        <div class="onboard-section">
-          <div class="onboard-section-num">4</div>
-          <div class="onboard-section-body">
-            <h2 class="onboard-section-title">Feature Flags</h2>
-            <p class="text-3 mb-4">Select which AI modules to activate for this client</p>
-            <div class="flag-grid">
-              <label class="flag-card">
-                <input type="checkbox" name="feature_loyalty" />
-                <div class="flag-card-inner">
-                  <div class="flag-icon" style="background:rgba(251,146,60,0.15);color:#fb923c">
-                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/></svg>
-                  </div>
-                  <div>
-                    <div class="flag-name">Loyalty Engine</div>
-                    <div class="flag-desc">Points, rewards &amp; tier management</div>
-                  </div>
-                </div>
-              </label>
-              <label class="flag-card">
-                <input type="checkbox" name="feature_gamification" />
-                <div class="flag-card-inner">
-                  <div class="flag-icon" style="background:rgba(52,211,153,0.15);color:#34d399">
-                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/></svg>
-                  </div>
-                  <div>
-                    <div class="flag-name">Gamified Checkout</div>
-                    <div class="flag-desc">Discount unlock gamification</div>
-                  </div>
-                </div>
-              </label>
-              <label class="flag-card">
-                <input type="checkbox" name="feature_rag" />
-                <div class="flag-card-inner">
-                  <div class="flag-icon" style="background:rgba(244,114,182,0.15);color:#f472b6">
-                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>
-                  </div>
-                  <div>
-                    <div class="flag-name">RAG Brain</div>
-                    <div class="flag-desc">Vector-search knowledge base</div>
-                  </div>
-                </div>
-              </label>
-              <label class="flag-card">
-                <input type="checkbox" name="feature_amazon" />
-                <div class="flag-card-inner">
-                  <div class="flag-icon" style="background:rgba(56,189,248,0.15);color:#38bdf8">
-                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
-                  </div>
-                  <div>
-                    <div class="flag-name">Amazon PDP</div>
-                    <div class="flag-desc">AI-optimised Amazon listings</div>
-                  </div>
-                </div>
-              </label>
-              <label class="flag-card">
-                <input type="checkbox" name="feature_ugc" />
-                <div class="flag-card-inner">
-                  <div class="flag-icon" style="background:rgba(251,191,36,0.15);color:#fbbf24">
-                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>
-                  </div>
-                  <div>
-                    <div class="flag-name">UGC Collect</div>
-                    <div class="flag-desc">User-generated content curation</div>
-                  </div>
-                </div>
-              </label>
-              <label class="flag-card">
-                <input type="checkbox" name="feature_tax_reports" />
-                <div class="flag-card-inner">
-                  <div class="flag-icon" style="background:rgba(167,139,250,0.15);color:#a78bfa">
-                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>
-                  </div>
-                  <div>
-                    <div class="flag-name">Tax Reports</div>
-                    <div class="flag-desc">Automated tax summaries</div>
-                  </div>
-                </div>
-              </label>
-            </div>
-          </div>
-        </div>
-
-        <div class="onboard-actions">
-          <button type="submit" id="onboard-submit-btn" class="btn btn-primary btn-lg">
-            <span class="btn-label">Provision workspace</span>
-            <span class="btn-spinner hidden"></span>
-          </button>
-        </div>
-      </form>
-
-      <div id="onboard-result" class="onboard-result hidden"></div>
+    </div>
+    <div id="onboard-section-2" class="onboard-section">
+      <h2>Contact channels</h2>
+      <div class="form-grid-2">
+        <div class="form-group"><label>Strategy email</label><input id="ob-strat" type="email" placeholder="strategy@brand.com"/></div>
+        <div class="form-group"><label>Ops email</label><input id="ob-ops" type="email" placeholder="ops@brand.com"/></div>
+        <div class="form-group"><label>CEO phone (WhatsApp)</label><input id="ob-ceo" type="text" placeholder="+447..."/></div>
+        <div class="form-group"><label>Calendly URL</label><input id="ob-cal" type="text" placeholder="https://calendly.com/..."/></div>
+      </div>
+    </div>
+    <div id="onboard-section-3" class="onboard-section">
+      <h2>Slack channels</h2>
+      <div class="form-grid-3">
+        <div class="form-group"><label>Leads</label><input id="ob-sl-leads" type="text" placeholder="#leads"/></div>
+        <div class="form-group"><label>Hot leads</label><input id="ob-sl-hot" type="text" placeholder="#hot-leads"/></div>
+        <div class="form-group"><label>Outreach</label><input id="ob-sl-out" type="text" placeholder="#outreach"/></div>
+        <div class="form-group"><label>CRM / Retention</label><input id="ob-sl-crm" type="text" placeholder="#crm"/></div>
+        <div class="form-group"><label>Support</label><input id="ob-sl-sup" type="text" placeholder="#support"/></div>
+        <div class="form-group"><label>Revenue alerts</label><input id="ob-sl-rev" type="text" placeholder="#revenue"/></div>
+      </div>
+    </div>
+    <div id="onboard-section-4" class="onboard-section">
+      <h2>AI + thresholds</h2>
+      <div class="form-grid-2">
+        <div class="form-group"><label>Brand voice</label><input id="ob-voice" type="text" placeholder="Friendly, expert, conversational"/></div>
+        <div class="form-group"><label>Free shipping threshold (£)</label><input id="ob-ship" type="number" placeholder="50"/></div>
+        <div class="form-group"><label>Hot lead score threshold</label><input id="ob-lscore" type="number" placeholder="80"/></div>
+        <div class="form-group"><label>Churn risk threshold</label><input id="ob-churn" type="number" placeholder="60"/></div>
+      </div>
+    </div>
+    <div id="onboard-error" class="alert alert-error" style="display:none"></div>
+    <div class="onboard-nav">
+      <button id="ob-back" class="btn btn-ghost" style="display:none">← Back</button>
+      <button id="ob-next" class="btn btn-primary">Next →</button>
     </div>
   </div>
+</div>
 
-  <!-- APP SHELL -->
-  <div id="screen-app" class="screen hidden app-shell">
+<!-- ═══════════════════════════════════════════
+     SCREEN: CLIENT PORTAL LOGIN
+════════════════════════════════════════════ -->
+<div id="screen-client" class="screen">
+  <div class="connect-wrap">
+    <div class="connect-logo">
+      <svg width="32" height="32" viewBox="0 0 40 40" fill="none"><rect width="40" height="40" rx="10" fill="#38bdf8"/><path d="M10 28L20 12l10 16H10z" fill="#0f172a"/></svg>
+      <span>Client Portal</span>
+    </div>
+    <h1 class="connect-title">Client Access</h1>
+    <p class="connect-sub">Enter the access token shared by your agency</p>
+    <div class="form-group"><label>Access token</label><input id="inp-client-token" type="text" placeholder="Paste your token..."/></div>
+    <div id="client-error" class="alert alert-error" style="display:none"></div>
+    <button id="btn-client-login" class="btn btn-primary btn-full">View my report</button>
+    <div class="connect-links"><a href="#" id="link-back-from-client">← Back to login</a></div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════
+     SCREEN: AGENCY PORTAL LOGIN
+════════════════════════════════════════════ -->
+<div id="screen-agency" class="screen">
+  <div class="connect-wrap">
+    <div class="connect-logo">
+      <svg width="32" height="32" viewBox="0 0 40 40" fill="none"><rect width="40" height="40" rx="10" fill="#f59e0b"/><path d="M10 28L20 12l10 16H10z" fill="#0f172a"/></svg>
+      <span>Agency Portal</span>
+    </div>
+    <h1 class="connect-title">Agency Login</h1>
+    <p class="connect-sub">Manage all your client tenants from one place</p>
+    <div class="form-group"><label>Agency API Key</label><input id="inp-agency-key" type="password" placeholder="ak-..."/></div>
+    <div id="agency-error" class="alert alert-error" style="display:none"></div>
+    <button id="btn-agency-login" class="btn btn-primary btn-full">Enter portal</button>
+    <div class="connect-links"><a href="#" id="link-back-from-agency">← Back to login</a></div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════
+     SCREEN: APP (main dashboard)
+════════════════════════════════════════════ -->
+<div id="screen-app" class="screen">
+  <div class="app-layout">
+
+    <!-- Sidebar -->
     <aside class="sidebar">
       <div class="sidebar-logo">
-        <div class="logo-mark"></div>
-        <span class="logo-text">D2C AI</span>
-        <div id="demo-badge" class="demo-badge hidden">Demo</div>
+        <svg width="28" height="28" viewBox="0 0 40 40" fill="none"><rect width="40" height="40" rx="10" fill="#38bdf8"/><path d="M10 28L20 12l10 16H10z" fill="#0f172a"/></svg>
+        <span>D2C AI</span>
       </div>
-
-      <nav class="sidebar-nav" id="sidebar-nav">
-        <button class="nav-item active" data-view="overview">
-          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></svg>
+      <div id="demo-mode-badge" class="demo-badge" style="display:none">DEMO</div>
+      <div id="sidebar-tenant" class="sidebar-tenant"></div>
+      <nav class="sidebar-nav">
+        <a href="#" class="nav-item active" data-view="overview">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></svg>
           Overview
-        </button>
-        <button class="nav-item" data-view="workflows">
-          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+        </a>
+        <a href="#" class="nav-item" data-view="live-feed">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2"/></svg>
+          Live Feed
+          <span id="nav-feed-dot" class="live-dot"></span>
+        </a>
+        <a href="#" class="nav-item" data-view="workflows">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
           Workflows
-        </button>
-        <button class="nav-item" data-view="analytics">
-          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg>
+        </a>
+        <a href="#" class="nav-item" data-view="analytics">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3v18h18"/><path d="m7 16 4-4 4 4 4-4"/></svg>
           Analytics
-        </button>
-        <button class="nav-item" data-view="integrations">
-          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/></svg>
+        </a>
+        <a href="#" class="nav-item" data-view="logs">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14,2 14,8 20,8"/></svg>
+          Logs
+        </a>
+        <a href="#" class="nav-item" data-view="content">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="m18.5 2.5 3 3L12 15l-4 1 1-4z"/></svg>
+          Content
+        </a>
+        <a href="#" class="nav-item" data-view="ab-tests">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 3H5a2 2 0 0 0-2 2v4m6-6h10a2 2 0 0 1 2 2v4M9 3v18m0 0h10a2 2 0 0 0 2-2v-4M9 21H5a2 2 0 0 1-2-2v-4m0 0h18"/></svg>
+          A/B Tests
+        </a>
+        <a href="#" class="nav-item" data-view="knowledge">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg>
+          Knowledge
+        </a>
+        <a href="#" class="nav-item" data-view="integrations">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/></svg>
           Integrations
-        </button>
-        <button class="nav-item" data-view="settings">
-          <svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+        </a>
+        <a href="#" class="nav-item" data-view="settings">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
           Settings
-        </button>
+        </a>
       </nav>
-
-      <div class="sidebar-tenant" id="sidebar-tenant">
-        <div class="tenant-avatar" id="tenant-avatar">A</div>
-        <div class="tenant-info">
-          <div class="tenant-name" id="tenant-name">Loading...</div>
-          <div id="tenant-plan-pill" class="plan-pill plan-growth">growth</div>
-        </div>
-      </div>
-
       <div class="sidebar-footer">
-        <button class="btn btn-outline btn-sm btn-full" id="btn-new-client">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
-          New client
-        </button>
-        <button class="btn btn-ghost btn-sm btn-full disconnect-btn" id="btn-disconnect">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
-          Disconnect
-        </button>
+        <button id="btn-report" class="btn-reports">Monthly Report</button>
+        <button id="btn-signout" class="btn-signout">Sign out</button>
       </div>
     </aside>
 
-    <main class="main-area">
-      <div id="main-content" class="main-content"></div>
-    </main>
+    <!-- Main content -->
+    <main class="main-content" id="main-content"></main>
+
   </div>
+</div>
 
-  <!-- Toast container -->
-  <div id="toast-container" class="toast-container" aria-live="polite"></div>
+<!-- ═══════════════════════════════════════════
+     SCREEN: CLIENT DASHBOARD (read-only)
+════════════════════════════════════════════ -->
+<div id="screen-client-dash" class="screen">
+  <div class="client-dash-wrap">
+    <div class="client-dash-header">
+      <div class="connect-logo">
+        <svg width="28" height="28" viewBox="0 0 40 40" fill="none"><rect width="40" height="40" rx="10" fill="#38bdf8"/><path d="M10 28L20 12l10 16H10z" fill="#0f172a"/></svg>
+        <span id="client-brand-name">Your Brand</span>
+      </div>
+      <span class="pill pill-info">Read-only view</span>
+    </div>
+    <div id="client-dash-content"></div>
+  </div>
+</div>
 
-  <script src="app.js"></script>
+<!-- ═══════════════════════════════════════════
+     SCREEN: AGENCY DASHBOARD
+════════════════════════════════════════════ -->
+<div id="screen-agency-dash" class="screen">
+  <div class="agency-wrap">
+    <div class="agency-header">
+      <div class="connect-logo">
+        <svg width="28" height="28" viewBox="0 0 40 40" fill="none"><rect width="40" height="40" rx="10" fill="#f59e0b"/><path d="M10 28L20 12l10 16H10z" fill="#0f172a"/></svg>
+        <span>Agency Portal</span>
+      </div>
+      <div style="display:flex;gap:8px">
+        <button id="btn-agency-new-tenant" class="btn btn-primary btn-sm">+ New tenant</button>
+        <button id="btn-agency-signout" class="btn btn-ghost btn-sm">Sign out</button>
+      </div>
+    </div>
+    <div id="agency-tenants-grid" class="agency-grid"></div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════
+     MODAL OVERLAY
+════════════════════════════════════════════ -->
+<div id="modal" class="modal-overlay" style="display:none">
+  <div class="modal-box">
+    <div class="modal-header">
+      <h3 id="modal-title">Modal</h3>
+      <button id="modal-close" class="modal-close">✕</button>
+    </div>
+    <div id="modal-body" class="modal-body"></div>
+  </div>
+</div>
+
+<!-- Toast container -->
+<div id="toast-container"></div>
+
+<script src="app.js"></script>
 </body>
 </html>

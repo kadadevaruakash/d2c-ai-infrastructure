@@ -8,6 +8,16 @@ const { createClient }        = require('@supabase/supabase-js');
 const { initScheduler }       = require('../scheduler');
 const { orchestrate, orchestratorEvents, emitWorkflowRun } = require('./orchestrator');
 const { triggerWorkflow, DEFAULT_PAYLOADS } = require('./workflow-trigger');
+const { billingRouter }          = require('./billing');
+const { shopifyOauthRouter }     = require('./shopify-oauth');
+const { clientPortalRouter }     = require('./client-portal');
+const { agencyRouter }           = require('./agency');
+const { brevoWebhookRouter, getEmailStats } = require('./brevo-webhooks');
+const { abTestingRouter }        = require('./ab-testing');
+const { contentCalendarRouter }  = require('./content-calendar');
+const { ragManagerRouter }       = require('./rag-manager');
+const { reportsRouter }          = require('./reports');
+const { logExecution }           = require('./execution-logger');
 
 // Webhook handlers
 const { handleLeadCapture }       = require('../workflows/acquire/a01-lead-capture');
@@ -25,6 +35,9 @@ const { handleSalesSignal }       = require('../workflows/scale/sc03-sales-auto'
 const { handleProductCreated }    = require('../workflows/scale/sc04-seo-meta');
 
 const app = express();
+
+// Raw body for Stripe webhook signature verification — must come before express.json()
+app.use('/api/billing/webhook/stripe', express.raw({ type: 'application/json' }));
 app.use(express.json());
 app.use(express.static(path.join(__dirname, '..', 'frontend')));
 
@@ -344,6 +357,85 @@ app.get('/api/tenants/:slug/events', requireApiKey, async (req, res) => {
     orchestratorEvents.off(channel, send);
   });
 });
+
+// ── Execution Logs ───────────────────────────
+app.get('/api/tenants/:slug/logs', requireApiKey, async (req, res) => {
+  const config = await getTenantConfig(req.params.slug);
+  if (!config) return res.status(404).json({ error: 'Tenant not found' });
+  const sb = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
+  const limit = Math.min(parseInt(req.query.limit) || 50, 200);
+  let q = sb.from('workflow_execution_logs').select('*').eq('tenant_id', config.tenant_id).order('executed_at', { ascending: false }).limit(limit);
+  if (req.query.workflow_id) q = q.eq('workflow_id', req.query.workflow_id);
+  if (req.query.status)      q = q.eq('status', req.query.status);
+  const { data, error } = await q;
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data || []);
+});
+
+// ── Revenue Attribution ───────────────────────
+app.get('/api/tenants/:slug/revenue-attribution', requireApiKey, async (req, res) => {
+  const config = await getTenantConfig(req.params.slug);
+  if (!config) return res.status(404).json({ error: 'Tenant not found' });
+  const sb = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
+  const days = parseInt(req.query.days) || 30;
+  const since = new Date(Date.now() - days * 86400000).toISOString();
+  const { data, error } = await sb.from('revenue_attribution').select('workflow_id, revenue, attributed_at').eq('tenant_id', config.tenant_id).gte('attributed_at', since).order('attributed_at', { ascending: false });
+  if (error) return res.status(500).json({ error: error.message });
+  // Aggregate by workflow
+  const map = {};
+  for (const row of (data || [])) {
+    map[row.workflow_id] = map[row.workflow_id] || { workflow_id: row.workflow_id, total: 0, count: 0 };
+    map[row.workflow_id].total += row.revenue || 0;
+    map[row.workflow_id].count++;
+  }
+  res.json(Object.values(map).sort((a, b) => b.total - a.total));
+});
+
+// ── Cohort Retention ─────────────────────────
+app.get('/api/tenants/:slug/cohorts', requireApiKey, async (req, res) => {
+  const config = await getTenantConfig(req.params.slug);
+  if (!config) return res.status(404).json({ error: 'Tenant not found' });
+  const sb = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
+  // Fetch loyalty transactions as proxy for repeat purchase retention
+  const { data } = await sb.from('loyalty_transactions').select('customer_id, created_at').eq('tenant_id', config.tenant_id).order('created_at', { ascending: true });
+  const rows = data || [];
+  // Build 6 monthly cohorts × 6 months retention
+  const cohorts = [];
+  const now = new Date();
+  for (let c = 5; c >= 0; c--) {
+    const cohortDate = new Date(now.getFullYear(), now.getMonth() - c, 1);
+    const cohortKey = cohortDate.toISOString().slice(0, 7);
+    const cohortCustomers = new Set(rows.filter(r => r.created_at?.slice(0, 7) === cohortKey).map(r => r.customer_id));
+    const size = cohortCustomers.size;
+    const retention = [];
+    for (let m = 0; m <= 5 - c; m++) {
+      const mDate = new Date(cohortDate.getFullYear(), cohortDate.getMonth() + m + 1, 1);
+      const mKey = mDate.toISOString().slice(0, 7);
+      const active = new Set(rows.filter(r => r.created_at?.slice(0, 7) === mKey && cohortCustomers.has(r.customer_id))).size;
+      retention.push(size > 0 ? Math.round((active / size) * 100) : null);
+    }
+    cohorts.push({ cohort: cohortKey, size, retention });
+  }
+  res.json(cohorts);
+});
+
+// ── Email Stats ───────────────────────────────
+app.get('/api/tenants/:slug/email-stats', requireApiKey, async (req, res) => {
+  const config = await getTenantConfig(req.params.slug);
+  if (!config) return res.status(404).json({ error: 'Tenant not found' });
+  res.json(await getEmailStats(config.tenant_id));
+});
+
+// ── New Feature Routers ───────────────────────
+app.use('/api/billing',  billingRouter);
+app.use('/api/shopify',  shopifyOauthRouter);
+app.use('/api',          clientPortalRouter);
+app.use('/api/agency',   agencyRouter);
+app.use('/api/webhook',  brevoWebhookRouter);
+app.use('/api',          requireApiKey, abTestingRouter);
+app.use('/api',          requireApiKey, contentCalendarRouter);
+app.use('/api',          requireApiKey, ragManagerRouter);
+app.use('/api',          requireApiKey, reportsRouter);
 
 // ── Start ────────────────────────────────────
 const PORT = process.env.PORT || 3000;
