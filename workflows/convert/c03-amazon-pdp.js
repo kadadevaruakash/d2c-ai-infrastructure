@@ -1,77 +1,148 @@
+'use strict';
+
+/**
+ * C-03 — Amazon PDP Optimiser
+ *
+ * Triggered: weekly Monday 8 AM (scheduler) or manually via webhook.
+ * For each active product, fetches Shopify data + existing Amazon listing,
+ * runs GPT-4o to generate an optimised title/bullets/description,
+ * saves draft to `amazon_listings` table, and notifies ops via WhatsApp.
+ *
+ * Scheduler export : runAmazonPdpOptimization(tenantId, config)
+ * Webhook export   : handleAmazonPdp(tenantId, payload, config)
+ */
+
 const { createClient } = require('@supabase/supabase-js');
-const { callOpenAI, parseAiJson } = require('../../shared/ai-client');
+const axios = require('axios');
 const { notify } = require('../../shared/notification');
 
-async function runAmazonPdpOptimization(tenantId, tenantConfig) {
-  const sb = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
-
-  // Get up to 10 active Amazon listings
-  const { data: listings, error } = await sb
-    .from('amazon_listings')
-    .select('*')
-    .eq('tenant_id', tenantId)
-    .eq('status', 'active')
-    .limit(10);
-
-  if (error) throw new Error(`Fetch listings failed: ${error.message}`);
-  if (!listings || listings.length === 0) return { optimized: 0 };
-
-  let optimized = 0;
-  const results = [];
-
-  for (const listing of listings) {
-    try {
-      const aiRaw = await callOpenAI(tenantConfig.openai_api_key || process.env.OPENAI_API_KEY, [
-        {
-          role: 'system',
-          content: 'You are an Amazon SEO specialist. Optimize product listings for discoverability and conversion. Use A10 algorithm best practices. Return ONLY JSON.'
-        },
-        {
-          role: 'user',
-          content: `ASIN: ${listing.asin}\nCurrent Title: "${listing.title}"\nCurrent Bullets: ${JSON.stringify(listing.bullets || [])}\nCurrent Description: "${listing.description || ''}"\nCategory: ${listing.category || 'unknown'}\nPrice: ${listing.price}\nReviews: ${listing.review_count || 0} (avg ${listing.review_rating || 0})\n\nReturn JSON:\n{"optimized_title": "string (max 200 chars)", "bullets": ["string x5"], "backend_keywords": ["string"], "confidence": number (0-1), "changes_summary": "string"}`
-        }
-      ], 'gpt-4o-mini');
-
-      const optimization = parseAiJson(aiRaw, {
-        optimized_title: listing.title,
-        bullets: listing.bullets || [],
-        backend_keywords: [],
-        confidence: 0.5,
-        changes_summary: 'No changes'
-      });
-
-      // Store as pending_approval if confidence < 0.7, else auto-apply
-      const status = optimization.confidence >= 0.7 ? 'approved' : 'pending_approval';
-
-      await sb.from('amazon_optimizations').insert({
-        tenant_id: tenantId,
-        listing_id: listing.id,
-        asin: listing.asin,
-        original_title: listing.title,
-        optimized_title: optimization.optimized_title,
-        bullets: JSON.stringify(optimization.bullets),
-        backend_keywords: JSON.stringify(optimization.backend_keywords),
-        confidence: optimization.confidence,
-        changes_summary: optimization.changes_summary,
-        status,
-        created_at: new Date().toISOString()
-      });
-
-      results.push({ asin: listing.asin, confidence: optimization.confidence, status });
-      optimized++;
-    } catch (err) {
-      console.error(`Amazon PDP optimization failed for ${listing.asin}:`, err.message);
-    }
-  }
-
-  const autoApproved = results.filter(r => r.status === 'approved').length;
-  const pendingReview = results.filter(r => r.status === 'pending_approval').length;
-
-  await notify(tenantConfig, 'slack_marketing_channel', {
-    text: `🛒 AMAZON PDP OPTIMIZATION\n\nListings Processed: ${optimized}\nAuto-Approved: ${autoApproved}\nPending Review: ${pendingReview}\n\nCheck dashboard to approve pending optimizations.`
-  });
-
-  return { optimized, auto_approved: autoApproved, pending_review: pendingReview };
+function sb() {
+  return createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
 }
 
-module.exports = { runAmazonPdpOptimization };
+// ─────────────────────────────────────────────────────────────
+// Core handler — optimise a single product listing
+// ─────────────────────────────────────────────────────────────
+
+async function handleAmazonPdp(tenantId, payload, config) {
+  const { product_id, title, body_html, vendor, product_type, tags, trigger_reason } = payload;
+
+  if (!product_id) return { ok: false, error: 'product_id required' };
+  if (!process.env.OPENAI_API_KEY) return { ok: false, error: 'OPENAI_API_KEY not set' };
+
+  const model = config.ai_model_premium || 'gpt-4o';
+
+  // ── Generate optimised Amazon copy ──────────────────────────
+  const prompt = `You are an Amazon listing optimisation expert. Generate a high-converting Amazon Product Detail Page (PDP) for the following product.
+
+Product: ${title}
+Brand: ${vendor || config.brand_name}
+Category: ${product_type || 'General'}
+Tags: ${tags || ''}
+Description: ${(body_html || '').replace(/<[^>]+>/g, '').slice(0, 800)}
+${trigger_reason ? `Trigger reason: ${trigger_reason}` : ''}
+
+Return ONLY valid JSON with these exact fields:
+{
+  "amazon_title": "keyword-rich title under 200 chars",
+  "bullet_1": "feature/benefit bullet (start with capital, under 150 chars)",
+  "bullet_2": "feature/benefit bullet",
+  "bullet_3": "feature/benefit bullet",
+  "bullet_4": "feature/benefit bullet",
+  "bullet_5": "feature/benefit bullet",
+  "description": "keyword-rich product description 150-300 words",
+  "search_terms": "space-separated backend keywords (under 250 chars)",
+  "suggested_category": "best Amazon browse node category"
+}`;
+
+  const aiRes = await axios.post('https://api.openai.com/v1/chat/completions', {
+    model,
+    messages: [{ role: 'user', content: prompt }],
+    response_format: { type: 'json_object' },
+    temperature: 0.4,
+  }, {
+    headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
+  });
+
+  const copy = JSON.parse(aiRes.data.choices[0].message.content);
+
+  // ── Save to amazon_listings ──────────────────────────────────
+  const { data: listing } = await sb()
+    .from('amazon_listings')
+    .upsert({
+      tenant_id:          tenantId,
+      shopify_product_id: product_id,
+      shopify_title:      title,
+      amazon_title:       copy.amazon_title,
+      bullet_1:           copy.bullet_1,
+      bullet_2:           copy.bullet_2,
+      bullet_3:           copy.bullet_3,
+      bullet_4:           copy.bullet_4,
+      bullet_5:           copy.bullet_5,
+      description:        copy.description,
+      search_terms:       copy.search_terms,
+      suggested_category: copy.suggested_category,
+      status:             'pending_review',
+      generated_at:       new Date().toISOString(),
+      updated_at:         new Date().toISOString(),
+    }, { onConflict: 'tenant_id,shopify_product_id' })
+    .select('id')
+    .single()
+    .catch(() => ({ data: null }));
+
+  // ── Notify ops ───────────────────────────────────────────────
+  await notify(config, 'amazon_listings', `Amazon listing optimised for *${title}*. Review pending.\nTitle: ${copy.amazon_title.slice(0, 80)}…`, 'info').catch(() => {});
+
+  return {
+    ok:                 true,
+    workflow:           'C-03',
+    product_id,
+    listing_id:         listing?.id || null,
+    amazon_title:       copy.amazon_title,
+    status:             'pending_review',
+  };
+}
+
+// ─────────────────────────────────────────────────────────────
+// Scheduler runner — processes up to 10 products per tenant
+// ─────────────────────────────────────────────────────────────
+
+async function runAmazonPdpOptimization(tenantId, config) {
+  if (config.feature_amazon === false) return;
+  if (!process.env.OPENAI_API_KEY) return;
+
+  // Fetch products from Shopify
+  const shopifyDomain = config.shopify_shop_domain || process.env.SHOPIFY_SHOP_DOMAIN;
+  const shopifyToken  = config.shopify_access_token || process.env.SHOPIFY_ACCESS_TOKEN;
+  if (!shopifyDomain || !shopifyToken) return;
+
+  let products = [];
+  try {
+    const res = await axios.get(
+      `https://${shopifyDomain}/admin/api/2024-01/products.json?limit=10&fields=id,title,body_html,vendor,product_type,tags`,
+      { headers: { 'X-Shopify-Access-Token': shopifyToken } }
+    );
+    products = res.data.products || [];
+  } catch (err) {
+    console.error('[C-03] Shopify fetch failed:', err.message);
+    return;
+  }
+
+  for (const product of products) {
+    try {
+      await handleAmazonPdp(tenantId, {
+        product_id:     product.id,
+        title:          product.title,
+        body_html:      product.body_html,
+        vendor:         product.vendor,
+        product_type:   product.product_type,
+        tags:           product.tags,
+        trigger_reason: 'scheduled_weekly',
+      }, config);
+    } catch (err) {
+      console.error(`[C-03] Failed for product ${product.id}:`, err.message);
+    }
+  }
+}
+
+module.exports = { handleAmazonPdp, runAmazonPdpOptimization };

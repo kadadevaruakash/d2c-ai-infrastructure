@@ -1,114 +1,173 @@
+'use strict';
+
+/**
+ * SC-02 — Funnel Analytics
+ *
+ * Triggered: daily 8 AM (scheduler) or manually via webhook.
+ * Computes full-funnel conversion metrics across Shopify and internal tables:
+ *   Sessions → Add-to-cart → Checkout initiated → Orders (conversion funnel)
+ *   + email funnel: sent → opened → clicked → replied
+ *   + WhatsApp support resolution rate
+ *
+ * Generates AI insight commentary, saves to `funnel_snapshots` table,
+ * and sends a digest to the strategy team.
+ *
+ * Scheduler export : runFunnelAnalytics(tenantId, config)
+ * Webhook export   : handleFunnelAnalytics(tenantId, payload, config)
+ */
+
 const { createClient } = require('@supabase/supabase-js');
-const { callOpenAI, parseAiJson } = require('../../shared/ai-client');
-const { notify } = require('../../shared/notification');
 const axios = require('axios');
+const { notify } = require('../../shared/notification');
 
-async function runFunnelAnalytics(tenantId, tenantConfig) {
-  const sb = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
+function sb() {
+  return createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
+}
 
-  const now = new Date();
-  const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
-  const dateStr = sevenDaysAgo.toISOString().split('T')[0];
+// ─────────────────────────────────────────────────────────────
+// Core handler
+// ─────────────────────────────────────────────────────────────
 
-  const shopifyDomain = tenantConfig.shopify_shop_domain || process.env.SHOPIFY_SHOP_DOMAIN;
-  const shopifyToken = tenantConfig.shopify_access_token || process.env.SHOPIFY_ACCESS_TOKEN;
+async function handleFunnelAnalytics(tenantId, payload, config) {
+  const days  = payload.days || 7;
+  const since = new Date(Date.now() - days * 86400000).toISOString();
 
-  // Fetch Shopify 7-day orders and GA4 funnel data in parallel
-  const [ordersResult, ga4Result] = await Promise.allSettled([
-    axios.get(`https://${shopifyDomain}/admin/api/2024-01/orders.json`, {
-      params: {
-        created_at_min: sevenDaysAgo.toISOString(),
-        status: 'any',
-        limit: 250,
-        fields: 'id,total_price,source_name,landing_site,referring_site,created_at'
-      },
-      headers: { 'X-Shopify-Access-Token': shopifyToken }
-    }),
-    fetchGA4FunnelData(tenantConfig)
+  // ── Pull metrics from all sources ────────────────────────
+  const [
+    ordersRes, cartsRes, checkoutsRes,
+    emailRes, supportRes, leadsRes,
+  ] = await Promise.all([
+    sb().from('orders').select('id, total_price, created_at').eq('tenant_id', tenantId).gte('created_at', since).catch(() => ({ data: [] })),
+    sb().from('cart_recoveries').select('id, status, cart_value').eq('tenant_id', tenantId).gte('created_at', since).catch(() => ({ data: [] })),
+    sb().from('checkout_events').select('id').eq('tenant_id', tenantId).gte('created_at', since).catch(() => ({ data: [] })),
+    sb().from('email_events').select('event_type').eq('tenant_id', tenantId).gte('created_at', since).catch(() => ({ data: [] })),
+    sb().from('support_tickets').select('id, status').eq('tenant_id', tenantId).gte('created_at', since).catch(() => ({ data: [] })),
+    sb().from('leads').select('id, category').eq('tenant_id', tenantId).gte('created_at', since).catch(() => ({ data: [] })),
   ]);
 
-  const orders = ordersResult.status === 'fulfilled' ? ordersResult.value.data.orders || [] : [];
-  const ga4Data = ga4Result.status === 'fulfilled' ? ga4Result.value : null;
+  const orders    = ordersRes.data    || [];
+  const carts     = cartsRes.data     || [];
+  const checkouts = checkoutsRes.data || [];
+  const emails    = emailRes.data     || [];
+  const tickets   = supportRes.data   || [];
+  const leads     = leadsRes.data     || [];
 
-  // Calculate conversion metrics
-  const totalRevenue = orders.reduce((s, o) => s + parseFloat(o.total_price || 0), 0);
-  const orderCount = orders.length;
-  const sessions = ga4Data?.sessions || 0;
-  const productViews = ga4Data?.product_views || 0;
-  const cartAdds = ga4Data?.cart_adds || 0;
-  const checkoutStarts = ga4Data?.checkout_starts || 0;
+  // ── Compute funnel metrics ────────────────────────────────
+  const totalRevenue   = orders.reduce((s, o) => s + parseFloat(o.total_price || 0), 0);
+  const cartCount      = carts.length;
+  const cartRecovered  = carts.filter(c => c.status === 'recovered').length;
+  const checkoutCount  = checkouts.length;
+  const orderCount     = orders.length;
 
-  const conversionRate = sessions > 0 ? (orderCount / sessions * 100) : 0;
-  const cartAddRate = productViews > 0 ? (cartAdds / productViews * 100) : 0;
-  const checkoutRate = cartAdds > 0 ? (checkoutStarts / cartAdds * 100) : 0;
-  const purchaseRate = checkoutStarts > 0 ? (orderCount / checkoutStarts * 100) : 0;
+  // Email funnel
+  const emailSent      = emails.filter(e => e.event_type === 'sent').length;
+  const emailOpened    = emails.filter(e => e.event_type === 'opened').length;
+  const emailClicked   = emails.filter(e => e.event_type === 'clicked').length;
+  const emailReplied   = emails.filter(e => e.event_type === 'replied').length;
 
-  // AI analysis
-  const aiRaw = await callOpenAI(tenantConfig.openai_api_key || process.env.OPENAI_API_KEY, [
-    {
-      role: 'system',
-      content: 'You are an e-commerce funnel analyst. Identify drop-off points and optimization opportunities. Return ONLY JSON.'
-    },
-    {
-      role: 'user',
-      content: `Period: Last 7 days\nSessions: ${sessions}\nProduct Views: ${productViews}\nCart Adds: ${cartAdds}\nCheckout Starts: ${checkoutStarts}\nOrders: ${orderCount}\nRevenue: $${totalRevenue.toFixed(2)}\nOverall Conversion Rate: ${conversionRate.toFixed(2)}%\n\nReturn JSON:\n{"biggest_drop_off": "string", "recommendations": ["string"], "health_score": number (1-10), "priority_fix": "string"}`
+  // Support
+  const ticketsTotal   = tickets.length;
+  const ticketsClosed  = tickets.filter(t => t.status === 'closed').length;
+  const resolutionRate = ticketsTotal > 0 ? Math.round((ticketsClosed / ticketsTotal) * 100) : 100;
+
+  // Leads
+  const hotLeads       = leads.filter(l => l.category === 'hot').length;
+  const leadTotal      = leads.length;
+
+  const funnel = {
+    period_days:     days,
+    // Purchase funnel
+    carts_created:   cartCount,
+    checkouts_started: checkoutCount,
+    orders_placed:   orderCount,
+    total_revenue:   +totalRevenue.toFixed(2),
+    cart_recovery_rate: cartCount > 0 ? +((cartRecovered / cartCount) * 100).toFixed(1) : 0,
+    checkout_to_order: checkoutCount > 0 ? +((orderCount / checkoutCount) * 100).toFixed(1) : 0,
+    // Email
+    email_sent:      emailSent,
+    email_open_rate: emailSent > 0 ? +((emailOpened / emailSent) * 100).toFixed(1) : 0,
+    email_click_rate: emailSent > 0 ? +((emailClicked / emailSent) * 100).toFixed(1) : 0,
+    email_reply_rate: emailSent > 0 ? +((emailReplied / emailSent) * 100).toFixed(1) : 0,
+    // Support
+    tickets_total:   ticketsTotal,
+    resolution_rate: resolutionRate,
+    // Leads
+    leads_total:     leadTotal,
+    hot_leads:       hotLeads,
+    lead_to_order:   leadTotal > 0 ? +((orderCount / leadTotal) * 100).toFixed(1) : 0,
+  };
+
+  // ── AI commentary ─────────────────────────────────────────
+  let headline = '';
+  let insights = [];
+  if (process.env.OPENAI_API_KEY) {
+    const roas_threshold   = config.roas_alert_threshold  || 3;
+    const margin_threshold = config.margin_alert_threshold || 40;
+
+    const prompt = `You are a growth analyst for ${config.brand_name}. Analyse these ${days}-day funnel metrics.
+
+${JSON.stringify(funnel, null, 2)}
+
+ROAS target: ${roas_threshold}x | Margin target: ${margin_threshold}%
+
+Return ONLY valid JSON:
+{
+  "headline": "one-line metric summary (e.g. Checkout rate up 8% — email click-through leading)",
+  "top_insight": "most important single insight",
+  "bottlenecks": ["biggest funnel drop-off 1", "biggest funnel drop-off 2"],
+  "wins": ["top positive signal"],
+  "actions": ["prioritised action 1", "prioritised action 2", "prioritised action 3"]
+}`;
+
+    try {
+      const aiRes = await axios.post('https://api.openai.com/v1/chat/completions', {
+        model: config.ai_model_standard || 'gpt-4o-mini',
+        messages: [{ role: 'user', content: prompt }],
+        response_format: { type: 'json_object' },
+        temperature: 0.3,
+      }, { headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` } });
+
+      const parsed = JSON.parse(aiRes.data.choices[0].message.content);
+      headline = parsed.headline;
+      insights = parsed.actions || [];
+      funnel.headline    = parsed.headline;
+      funnel.top_insight = parsed.top_insight;
+      funnel.bottlenecks = parsed.bottlenecks;
+      funnel.wins        = parsed.wins;
+      funnel.actions     = parsed.actions;
+    } catch (err) {
+      console.error('[SC-02] AI insights failed:', err.message);
     }
-  ], 'gpt-4o-mini');
-
-  const analysis = parseAiJson(aiRaw, {
-    biggest_drop_off: 'Unable to determine',
-    recommendations: ['Review funnel data manually'],
-    health_score: 5,
-    priority_fix: 'Review checkout flow'
-  });
-
-  // Store analytics
-  const reportId = 'FNL-' + Date.now();
-  await sb.from('funnel_analytics').insert({
-    report_id: reportId,
-    tenant_id: tenantId,
-    period_start: sevenDaysAgo.toISOString(),
-    period_end: now.toISOString(),
-    sessions,
-    product_views: productViews,
-    cart_adds: cartAdds,
-    checkout_starts: checkoutStarts,
-    orders: orderCount,
-    revenue: totalRevenue,
-    conversion_rate: conversionRate,
-    cart_add_rate: cartAddRate,
-    checkout_rate: checkoutRate,
-    purchase_rate: purchaseRate,
-    health_score: analysis.health_score,
-    biggest_drop_off: analysis.biggest_drop_off,
-    recommendations: JSON.stringify(analysis.recommendations),
-    created_at: now.toISOString()
-  });
-
-  // Push to Google Sheets if configured
-  if (tenantConfig.google_sheets_funnel_id) {
-    console.log(`[Google Sheets] Would append funnel data to ${tenantConfig.google_sheets_funnel_id}`);
   }
 
-  await notify(tenantConfig, 'slack_marketing_channel', {
-    text: `📊 7-DAY FUNNEL REPORT\n\nSessions: ${sessions.toLocaleString()}\nConversion Rate: ${conversionRate.toFixed(2)}%\nOrders: ${orderCount}\nRevenue: $${totalRevenue.toFixed(2)}\nHealth Score: ${analysis.health_score}/10\n\nBiggest Drop-off: ${analysis.biggest_drop_off}\nPriority Fix: ${analysis.priority_fix}`
-  });
+  // ── Save snapshot ─────────────────────────────────────────
+  await sb().from('funnel_snapshots').insert({
+    tenant_id:    tenantId,
+    period_days:  days,
+    metrics:      funnel,
+    snapshot_at:  new Date().toISOString(),
+  }).catch(() => {});
 
-  return { report_id: reportId, conversion_rate: conversionRate, health_score: analysis.health_score };
+  // ── Notify strategy team ──────────────────────────────────
+  const msg = `📊 *${days}-Day Funnel Report*\n` +
+    `Revenue: *$${funnel.total_revenue}* | Orders: *${funnel.orders_placed}*\n` +
+    `Cart recovery: *${funnel.cart_recovery_rate}%* | Email open: *${funnel.email_open_rate}%*\n` +
+    `Support resolution: *${funnel.resolution_rate}%*\n` +
+    (headline ? `\n${headline}` : '') +
+    (insights.length > 0 ? `\n\nActions:\n${insights.slice(0, 3).map(a => `• ${a}`).join('\n')}` : '');
+
+  const hasIssues = funnel.cart_recovery_rate < 10 || funnel.email_open_rate < 15;
+  await notify(config, 'analytics', msg, hasIssues ? 'warning' : 'info').catch(() => {});
+
+  return { ok: true, workflow: 'SC-02', period_days: days, metrics: funnel };
 }
 
-async function fetchGA4FunnelData(tenantConfig) {
-  // GA4 Data API integration placeholder
-  // Requires googleapis + service account setup
-  // Returns mock structure if not configured
-  const ga4PropertyId = tenantConfig.ga4_property_id || process.env.GA4_PROPERTY_ID;
-  if (!ga4PropertyId) {
-    return { sessions: 0, product_views: 0, cart_adds: 0, checkout_starts: 0 };
-  }
+// ─────────────────────────────────────────────────────────────
+// Scheduler runner
+// ─────────────────────────────────────────────────────────────
 
-  // TODO: implement with googleapis when credential is configured
-  console.log(`[GA4] Would fetch funnel data for property ${ga4PropertyId}`);
-  return { sessions: 0, product_views: 0, cart_adds: 0, checkout_starts: 0 };
+async function runFunnelAnalytics(tenantId, config) {
+  await handleFunnelAnalytics(tenantId, { days: 7 }, config);
 }
 
-module.exports = { runFunnelAnalytics };
+module.exports = { handleFunnelAnalytics, runFunnelAnalytics };

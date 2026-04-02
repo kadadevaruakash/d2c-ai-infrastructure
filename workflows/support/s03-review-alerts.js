@@ -1,113 +1,173 @@
+'use strict';
+
+/**
+ * S-03 — Review Sentiment & Alerts
+ *
+ * Triggered: every 15 minutes (scheduler) or via webhook when a new review arrives.
+ * Fetches unprocessed reviews from `product_reviews` table (or inbound webhook payload),
+ * runs GPT-4o-mini sentiment analysis, auto-drafts a response, saves to `review_responses`,
+ * and escalates critical reviews to the CEO via cascade → S-04.
+ *
+ * Cascades → S-04 when urgency = 'critical' (score < -0.6 or rating <= 2)
+ * Cascades → SC-04 when product_id present (refresh SEO meta after review mention)
+ *
+ * Scheduler export : runReviewAlerts(tenantId, config)
+ * Webhook export   : handleReviewAlert(tenantId, payload, config)
+ */
+
 const { createClient } = require('@supabase/supabase-js');
-const { callOpenAI, parseAiJson } = require('../../shared/ai-client');
-const { notify } = require('../../shared/notification');
 const axios = require('axios');
+const { notify } = require('../../shared/notification');
 
-// GMB returns word-form star ratings, not numeric
-const STAR_MAP = { FIVE: 5, FOUR: 4, THREE: 3, TWO: 2, ONE: 1 };
-
-async function runReviewAlerts(tenantId, tenantConfig) {
-  const sb = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
-
-  const gmbAccountId = tenantConfig.gmb_account_id || process.env.GMB_ACCOUNT_ID;
-  const gmbLocationId = tenantConfig.gmb_location_id || process.env.GMB_LOCATION_ID;
-  const gmbToken = tenantConfig.gmb_access_token || process.env.GMB_ACCESS_TOKEN;
-
-  // Fetch GMB reviews and recent alerts in parallel
-  const [reviewsResult, recentAlertsResult] = await Promise.allSettled([
-    axios.get(
-      `https://mybusiness.googleapis.com/v4/accounts/${gmbAccountId}/locations/${gmbLocationId}/reviews`,
-      {
-        params: { pageSize: 10 },
-        headers: { Authorization: `Bearer ${gmbToken}` }
-      }
-    ),
-    sb.from('review_alerts')
-      .select('review_id')
-      .eq('tenant_id', tenantId)
-      .gte('created_at', new Date(Date.now() - 60 * 60 * 1000).toISOString())
-  ]);
-
-  const gmbReviews = reviewsResult.status === 'fulfilled' ? reviewsResult.value.data?.reviews || [] : [];
-  const recentAlerts = recentAlertsResult.status === 'fulfilled' ? recentAlertsResult.value.data || [] : [];
-  const alertedIds = recentAlerts.map(a => a.review_id);
-
-  const newReviews = gmbReviews.filter(r => {
-    const id = r.reviewId || r.name;
-    return !alertedIds.includes(id);
-  }).map(r => ({
-    review_id: r.reviewId || r.name,
-    platform: 'google',
-    // FIX: STAR_MAP handles "FIVE", "FOUR", etc. — NOT parseInt(replace('STAR_', ''))
-    rating: r.starRating ? (STAR_MAP[r.starRating] || 5) : 5,
-    review_text: r.comment || '',
-    reviewer_name: r.reviewer?.displayName || 'Anonymous',
-    review_time: r.createTime || new Date().toISOString()
-  }));
-
-  if (newReviews.length === 0) return { processed: 0 };
-
-  let processed = 0;
-
-  for (const review of newReviews) {
-    try {
-      const aiRaw = await callOpenAI(tenantConfig.openai_api_key || process.env.OPENAI_API_KEY, [
-        {
-          role: 'system',
-          content: 'You are a reputation management specialist. Analyze sentiment, draft an appropriate response. Empathetic for negative reviews. Thank positive reviewers. Never defensive. Return ONLY JSON.'
-        },
-        {
-          role: 'user',
-          content: `Platform: ${review.platform}\nRating: ${review.rating}/5\nReview: '${review.review_text}'\nReviewer: ${review.reviewer_name}\n\nReturn JSON:\n{"sentiment": "positive|neutral|negative", "urgency": "low|medium|high|critical", "response_draft": "string", "action_required": "string"}`
-        }
-      ], 'gpt-4o-mini');
-
-      const analysis = parseAiJson(aiRaw, {
-        sentiment: review.rating >= 4 ? 'positive' : review.rating <= 2 ? 'negative' : 'neutral',
-        urgency: review.rating <= 2 ? 'high' : 'low',
-        response_draft: 'Thank you for your feedback!',
-        action_required: 'none'
-      });
-
-      let alertChannel = 'slack_cx_channel';
-      if (analysis.urgency === 'critical') alertChannel = 'slack_urgent_channel';
-      else if (analysis.urgency === 'high') alertChannel = 'slack_cx_channel';
-
-      const alertId = 'REV-' + Date.now() + Math.random().toString(36).substring(2, 5);
-
-      await sb.from('review_alerts').insert({
-        alert_id: alertId,
-        tenant_id: tenantId,
-        review_id: review.review_id,
-        platform: review.platform,
-        rating: review.rating,
-        reviewer_name: review.reviewer_name,
-        review_text: review.review_text,
-        sentiment: analysis.sentiment,
-        urgency: analysis.urgency,
-        response_draft: analysis.response_draft,
-        action_required: analysis.action_required,
-        created_at: new Date().toISOString()
-      });
-
-      await notify(tenantConfig, alertChannel, {
-        text: `⭐ NEW REVIEW ALERT\n\nPlatform: ${review.platform}\nRating: ${review.rating}/5 ⭐\nSentiment: ${analysis.sentiment}\nUrgency: ${analysis.urgency}\n\nReviewer: ${review.reviewer_name}\n"${review.review_text.substring(0, 200)}"\n\n💬 Suggested Response:\n${analysis.response_draft}${analysis.urgency === 'critical' ? '\n\n⚠️ CRITICAL — Requires immediate attention' : ''}`
-      });
-
-      if (analysis.urgency === 'critical') {
-        await notify(tenantConfig, 'email_manager', {
-          subject: '🚨 CRITICAL REVIEW ALERT',
-          text: `A critical review requires immediate attention.\n\nRating: ${review.rating}/5\nReview: ${review.review_text}\n\nSuggested Response:\n${analysis.response_draft}\n\nAction Required: ${analysis.action_required}`
-        });
-      }
-
-      processed++;
-    } catch (err) {
-      console.error(`Review alert failed for ${review.review_id}:`, err.message);
-    }
-  }
-
-  return { processed };
+function sb() {
+  return createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
 }
 
-module.exports = { runReviewAlerts };
+// ─────────────────────────────────────────────────────────────
+// Core handler — analyse a single review
+// ─────────────────────────────────────────────────────────────
+
+async function handleReviewAlert(tenantId, payload, config) {
+  const { review_id, review_text, rating, reviewer_name, product_id, product_title, platform } = payload;
+
+  if (!review_text) return { ok: false, error: 'review_text required' };
+  if (!process.env.OPENAI_API_KEY) return { ok: false, error: 'OPENAI_API_KEY not set' };
+
+  const model = config.ai_model_standard || 'gpt-4o-mini';
+
+  // ── Sentiment analysis + response draft ─────────────────
+  const prompt = `You are a customer experience specialist for ${config.brand_name}.
+
+Analyse this customer review and draft a professional response.
+
+Platform: ${platform || 'unknown'}
+Product: ${product_title || 'unknown'}
+Rating: ${rating || 'not provided'}/5
+Reviewer: ${reviewer_name || 'Customer'}
+Review: "${review_text}"
+
+Return ONLY valid JSON:
+{
+  "sentiment_score": -1.0 to 1.0 (negative = bad, positive = good),
+  "sentiment_label": "very_negative|negative|neutral|positive|very_positive",
+  "key_issues": ["issue 1", "issue 2"],
+  "key_positives": ["positive 1"],
+  "urgency": "low|medium|high|critical",
+  "response_draft": "professional brand response (2-4 sentences, empathetic, on-brand)",
+  "internal_note": "internal action note for the team",
+  "product_insight": "any product improvement insight from this review"
+}`;
+
+  const aiRes = await axios.post('https://api.openai.com/v1/chat/completions', {
+    model,
+    messages: [{ role: 'user', content: prompt }],
+    response_format: { type: 'json_object' },
+    temperature: 0.3,
+  }, {
+    headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
+  });
+
+  const analysis = JSON.parse(aiRes.data.choices[0].message.content);
+
+  // ── Save response draft ──────────────────────────────────
+  const { data: responseRecord } = await sb()
+    .from('review_responses')
+    .insert({
+      tenant_id:       tenantId,
+      review_id:       review_id || null,
+      platform:        platform || 'unknown',
+      product_id:      product_id || null,
+      product_title:   product_title || null,
+      reviewer_name:   reviewer_name || null,
+      review_text,
+      rating:          rating || null,
+      sentiment_score: analysis.sentiment_score,
+      sentiment_label: analysis.sentiment_label,
+      key_issues:      analysis.key_issues,
+      key_positives:   analysis.key_positives,
+      urgency:         analysis.urgency,
+      response_draft:  analysis.response_draft,
+      internal_note:   analysis.internal_note,
+      product_insight: analysis.product_insight,
+      status:          'draft',
+      created_at:      new Date().toISOString(),
+    })
+    .select('id')
+    .single()
+    .catch(() => ({ data: null }));
+
+  // ── Mark source review as processed ─────────────────────
+  if (review_id) {
+    await sb().from('product_reviews')
+      .update({ processed: true, processed_at: new Date().toISOString() })
+      .eq('id', review_id)
+      .catch(() => {});
+  }
+
+  // ── Notify team for negative / critical reviews ──────────
+  const isNegative = analysis.sentiment_score < 0 || (rating && parseInt(rating) <= 3);
+  const isCritical = analysis.urgency === 'critical' || analysis.sentiment_score < -0.6 || (rating && parseInt(rating) <= 2);
+
+  if (isNegative) {
+    const msg = `${isCritical ? '🚨' : '⚠️'} *${isCritical ? 'Critical' : 'Negative'} Review* — ${platform || 'store'}\n` +
+      `Product: ${product_title || 'N/A'} | Rating: ${rating || '?'}/5\n` +
+      `"${review_text.slice(0, 120)}${review_text.length > 120 ? '…' : ''}"\n` +
+      `Sentiment: ${analysis.sentiment_label} (${analysis.sentiment_score.toFixed(2)})\n` +
+      `Issues: ${(analysis.key_issues || []).join(', ') || 'none identified'}`;
+
+    await notify(config, 'review_alerts', msg, isCritical ? 'critical' : 'warning').catch(() => {});
+  }
+
+  return {
+    ok:              true,
+    workflow:        'S-03',
+    review_id,
+    response_id:     responseRecord?.id || null,
+    sentiment_score: analysis.sentiment_score,
+    sentiment_label: analysis.sentiment_label,
+    urgency:         analysis.urgency,
+    is_critical:     isCritical,
+    product_id:      product_id || null,
+    // These fields are read by CASCADE_MAP to trigger S-04 and SC-04
+    review_text,
+    product_title,
+    rating,
+  };
+}
+
+// ─────────────────────────────────────────────────────────────
+// Scheduler runner — process unanalysed reviews in bulk
+// ─────────────────────────────────────────────────────────────
+
+async function runReviewAlerts(tenantId, config) {
+  if (!process.env.OPENAI_API_KEY) return;
+
+  const { data: reviews } = await sb()
+    .from('product_reviews')
+    .select('id, review_text, rating, reviewer_name, product_id, product_title, platform')
+    .eq('tenant_id', tenantId)
+    .eq('processed', false)
+    .order('created_at', { ascending: true })
+    .limit(20)
+    .catch(() => ({ data: [] }));
+
+  if (!reviews || reviews.length === 0) return;
+
+  for (const review of reviews) {
+    try {
+      await handleReviewAlert(tenantId, {
+        review_id:     review.id,
+        review_text:   review.review_text,
+        rating:        review.rating,
+        reviewer_name: review.reviewer_name,
+        product_id:    review.product_id,
+        product_title: review.product_title,
+        platform:      review.platform,
+      }, config);
+    } catch (err) {
+      console.error(`[S-03] Failed for review ${review.id}:`, err.message);
+    }
+  }
+}
+
+module.exports = { handleReviewAlert, runReviewAlerts };

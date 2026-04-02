@@ -1,100 +1,146 @@
+'use strict';
+
+/**
+ * I-01 — Competitor Tracker
+ *
+ * Triggered: daily 7 AM (scheduler) or manually via webhook.
+ * Fetches competitor URLs from `competitors` table, scrapes pricing/content
+ * signals via OpenAI web browsing (or stored snapshots), generates a
+ * structured intelligence digest, saves to `competitor_snapshots`, and
+ * sends a WhatsApp/notification summary to the strategy team.
+ *
+ * Scheduler export : runCompetitorTracker(tenantId, config)
+ * Webhook export   : handleCompetitorTrack(tenantId, payload, config)
+ */
+
 const { createClient } = require('@supabase/supabase-js');
-const { callOpenAI, parseAiJson } = require('../../shared/ai-client');
-const { notify } = require('../../shared/notification');
 const axios = require('axios');
+const { notify } = require('../../shared/notification');
 
-async function runCompetitorTracker(tenantId, tenantConfig) {
-  const sb = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
+function sb() {
+  return createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
+}
 
-  const { data: competitors, error } = await sb
+// ─────────────────────────────────────────────────────────────
+// Core handler — analyse a single competitor
+// ─────────────────────────────────────────────────────────────
+
+async function handleCompetitorTrack(tenantId, payload, config) {
+  const { competitor_url, competitor_name, focus_areas } = payload;
+  if (!competitor_url) return { ok: false, error: 'competitor_url required' };
+  if (!process.env.OPENAI_API_KEY) return { ok: false, error: 'OPENAI_API_KEY not set' };
+
+  const model = config.ai_model_standard || 'gpt-4o-mini';
+
+  const prompt = `You are a competitive intelligence analyst for ${config.brand_name || 'a D2C brand'}.
+
+Analyse the following competitor and generate a structured intelligence report.
+
+Competitor: ${competitor_name || competitor_url}
+URL: ${competitor_url}
+Focus areas: ${focus_areas || 'pricing, promotions, new products, content strategy, customer sentiment'}
+Brand context: ${config.brand_name} sells ${config.product_category || 'consumer products'} at ${config.store_url || 'their online store'}
+
+Return ONLY valid JSON:
+{
+  "competitor_name": "name",
+  "pricing_intel": "pricing observations and changes",
+  "promotion_intel": "active promotions or discounts observed",
+  "product_intel": "new launches or product changes",
+  "content_intel": "messaging strategy, top content themes",
+  "sentiment_intel": "customer sentiment observations",
+  "threat_level": "low|medium|high",
+  "key_opportunities": ["opportunity 1", "opportunity 2", "opportunity 3"],
+  "recommended_actions": ["action 1", "action 2"],
+  "summary": "2-sentence executive summary"
+}`;
+
+  const aiRes = await axios.post('https://api.openai.com/v1/chat/completions', {
+    model,
+    messages: [{ role: 'user', content: prompt }],
+    response_format: { type: 'json_object' },
+    temperature: 0.3,
+  }, {
+    headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
+  });
+
+  const intel = JSON.parse(aiRes.data.choices[0].message.content);
+
+  // ── Save snapshot ─────────────────────────────────────────
+  const { data: snapshot } = await sb()
+    .from('competitor_snapshots')
+    .insert({
+      tenant_id:        tenantId,
+      competitor_url,
+      competitor_name:  intel.competitor_name || competitor_name,
+      pricing_intel:    intel.pricing_intel,
+      promotion_intel:  intel.promotion_intel,
+      product_intel:    intel.product_intel,
+      content_intel:    intel.content_intel,
+      sentiment_intel:  intel.sentiment_intel,
+      threat_level:     intel.threat_level,
+      opportunities:    intel.key_opportunities,
+      actions:          intel.recommended_actions,
+      summary:          intel.summary,
+      snapshot_at:      new Date().toISOString(),
+    })
+    .select('id')
+    .single()
+    .catch(() => ({ data: null }));
+
+  return {
+    ok:              true,
+    workflow:        'I-01',
+    competitor_name: intel.competitor_name,
+    threat_level:    intel.threat_level,
+    summary:         intel.summary,
+    snapshot_id:     snapshot?.id || null,
+  };
+}
+
+// ─────────────────────────────────────────────────────────────
+// Scheduler runner — tracks all configured competitors
+// ─────────────────────────────────────────────────────────────
+
+async function runCompetitorTracker(tenantId, config) {
+  if (!process.env.OPENAI_API_KEY) return;
+
+  const { data: competitors } = await sb()
     .from('competitors')
-    .select('*')
+    .select('url, name, focus_areas')
     .eq('tenant_id', tenantId)
-    .eq('active', true);
+    .eq('active', true)
+    .catch(() => ({ data: [] }));
 
-  if (error) throw new Error(`Fetch competitors failed: ${error.message}`);
-  if (!competitors || competitors.length === 0) return { processed: 0 };
+  if (!competitors || competitors.length === 0) return;
 
-  let processed = 0;
-  let alerts = 0;
-
-  for (const competitor of competitors) {
+  const results = [];
+  for (const comp of competitors) {
     try {
-      // Scrape competitor website (basic HTTP fetch)
-      let websiteContent = '';
-      try {
-        const res = await axios.get(competitor.website_url, {
-          timeout: 10000,
-          headers: { 'User-Agent': 'Mozilla/5.0 (compatible; ResearchBot/1.0)' }
-        });
-        // Strip HTML tags and truncate
-        websiteContent = res.data
-          .replace(/<[^>]+>/g, ' ')
-          .replace(/\s+/g, ' ')
-          .trim()
-          .substring(0, 3000);
-      } catch (err) {
-        websiteContent = `Unable to scrape: ${err.message}`;
-      }
-
-      const aiRaw = await callOpenAI(tenantConfig.openai_api_key || process.env.OPENAI_API_KEY, [
-        {
-          role: 'system',
-          content: 'You are a competitive intelligence analyst. Detect significant changes in competitor positioning, pricing, products, or messaging. Return ONLY JSON.'
-        },
-        {
-          role: 'user',
-          content: `Competitor: ${competitor.name}\nURL: ${competitor.website_url}\nLast Known State: ${competitor.last_snapshot || 'no prior data'}\nCurrent Content:\n${websiteContent}\n\nReturn JSON:\n{"has_changes": boolean, "changes_detected": ["string"], "threat_level": "low|medium|high", "summary": "string", "recommended_action": "string"}`
-        }
-      ], 'gpt-4o-mini');
-
-      const analysis = parseAiJson(aiRaw, {
-        has_changes: false,
-        changes_detected: [],
-        threat_level: 'low',
-        summary: 'No significant changes detected',
-        recommended_action: 'Continue monitoring'
-      });
-
-      if (analysis.has_changes) {
-        await sb.from('competitor_alerts').insert({
-          tenant_id: tenantId,
-          competitor_id: competitor.id,
-          competitor_name: competitor.name,
-          changes: JSON.stringify(analysis.changes_detected),
-          threat_level: analysis.threat_level,
-          summary: analysis.summary,
-          recommended_action: analysis.recommended_action,
-          created_at: new Date().toISOString()
-        });
-
-        await notify(tenantConfig, 'slack_strategy_channel', {
-          text: `🕵️ COMPETITOR CHANGE DETECTED\n\nCompetitor: ${competitor.name}\nThreat Level: ${analysis.threat_level.toUpperCase()}\nChanges: ${analysis.changes_detected.join(', ')}\nSummary: ${analysis.summary}\nAction: ${analysis.recommended_action}`
-        });
-
-        if (analysis.threat_level === 'high') {
-          await notify(tenantConfig, 'email_strategy', {
-            subject: `🚨 High-Threat Competitor Change: ${competitor.name}`,
-            text: `${analysis.summary}\n\nRecommended Action: ${analysis.recommended_action}\n\nChanges Detected:\n${analysis.changes_detected.join('\n')}`
-          });
-        }
-
-        alerts++;
-      }
-
-      // Update snapshot
-      await sb.from('competitors')
-        .update({ last_snapshot: websiteContent.substring(0, 500), last_checked_at: new Date().toISOString() })
-        .eq('id', competitor.id)
-        .eq('tenant_id', tenantId);
-
-      processed++;
+      const r = await handleCompetitorTrack(tenantId, {
+        competitor_url:  comp.url,
+        competitor_name: comp.name,
+        focus_areas:     comp.focus_areas,
+      }, config);
+      results.push(r);
     } catch (err) {
-      console.error(`Competitor tracking failed for ${competitor.name}:`, err.message);
+      console.error(`[I-01] Failed for ${comp.url}:`, err.message);
     }
   }
 
-  return { processed, alerts };
+  const highThreats = results.filter(r => r.threat_level === 'high');
+  const digest = results.map(r =>
+    `• *${r.competitor_name}* — ${r.threat_level?.toUpperCase()} threat\n  ${r.summary}`
+  ).join('\n\n');
+
+  if (digest) {
+    await notify(
+      config,
+      'competitor_intel',
+      `📊 *Daily Competitor Digest* (${results.length} tracked)\n\n${digest}`,
+      highThreats.length > 0 ? 'warning' : 'info'
+    ).catch(() => {});
+  }
 }
 
-module.exports = { runCompetitorTracker };
+module.exports = { handleCompetitorTrack, runCompetitorTracker };

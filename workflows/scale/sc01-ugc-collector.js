@@ -1,122 +1,214 @@
+'use strict';
+
+/**
+ * SC-01 — UGC Collector
+ *
+ * Triggered: every 6 hours (scheduler) or manually via webhook.
+ * Scans Instagram mentions/tags (via Instagram Graph API) and stored UGC leads,
+ * scores creators by follower count + engagement, identifies top UGC candidates,
+ * generates personalised outreach briefs with GPT-4o-mini,
+ * and sends outreach via Brevo. Saves results to `ugc_leads` table.
+ *
+ * Scheduler export : runUgcCollector(tenantId, config)
+ * Webhook export   : handleUgcCollect(tenantId, payload, config)
+ */
+
 const { createClient } = require('@supabase/supabase-js');
-const { callOpenAI, parseAiJson } = require('../../shared/ai-client');
-const { notify } = require('../../shared/notification');
 const axios = require('axios');
+const { notify } = require('../../shared/notification');
 
-async function runUgcCollector(tenantId, tenantConfig) {
-  const sb = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
+function sb() {
+  return createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
+}
 
-  const igToken = tenantConfig.instagram_access_token || process.env.INSTAGRAM_ACCESS_TOKEN;
+// ─────────────────────────────────────────────────────────────
+// Score a UGC creator
+// ─────────────────────────────────────────────────────────────
 
-  // Fetch tagged posts and existing UGC in parallel
-  const [igResult, existingResult] = await Promise.allSettled([
-    axios.get('https://graph.instagram.com/me/tags', {
-      params: {
-        // owner field contains the IGSID — required for permission DMs
-        fields: 'id,caption,media_type,media_url,permalink,timestamp,username,owner',
-        access_token: igToken
+function _scoreCreator(creator) {
+  const followers   = creator.follower_count || 0;
+  const engagement  = creator.engagement_rate || 0; // decimal e.g. 0.04 = 4%
+  const isVerified  = creator.is_verified ? 10 : 0;
+
+  // Nano (1K-10K) and micro (10K-100K) get bonus — better engagement ROI
+  const followerScore = followers < 1000   ? 5
+    : followers < 10000  ? 25
+    : followers < 100000 ? 20
+    : followers < 500000 ? 15
+    : 10;
+
+  const engagementScore = engagement >= 0.08 ? 40
+    : engagement >= 0.05 ? 30
+    : engagement >= 0.03 ? 20
+    : 10;
+
+  return Math.min(100, followerScore + engagementScore + isVerified);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Generate outreach brief
+// ─────────────────────────────────────────────────────────────
+
+async function _generateOutreachBrief(creator, config) {
+  if (!process.env.OPENAI_API_KEY) {
+    return {
+      email_subject: `Collaboration opportunity with ${config.brand_name}`,
+      email_body:    `Hi ${creator.username}, we love your content and would love to collaborate!`,
+    };
+  }
+
+  const prompt = `Write a personalised UGC outreach email from ${config.brand_name} to an Instagram creator.
+
+Creator: @${creator.username}
+Followers: ${(creator.follower_count || 0).toLocaleString()}
+Engagement rate: ${((creator.engagement_rate || 0) * 100).toFixed(1)}%
+Content niche: ${creator.niche || 'lifestyle'}
+Brand voice: ${config.brand_voice || 'friendly and authentic'}
+Brand: ${config.brand_name} — ${config.product_category || 'D2C products'}
+
+Keep it short (3 paragraphs), authentic, not corporate. Offer a free product + commission.
+
+Return ONLY valid JSON:
+{
+  "email_subject": "subject line under 55 chars",
+  "email_body": "plain text email body",
+  "brief_summary": "one-line outreach pitch for internal notes"
+}`;
+
+  const aiRes = await axios.post('https://api.openai.com/v1/chat/completions', {
+    model: config.ai_model_standard || 'gpt-4o-mini',
+    messages: [{ role: 'user', content: prompt }],
+    response_format: { type: 'json_object' },
+    temperature: 0.7,
+  }, { headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` } });
+
+  return JSON.parse(aiRes.data.choices[0].message.content);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Core handler — process a single UGC lead
+// ─────────────────────────────────────────────────────────────
+
+async function handleUgcCollect(tenantId, payload, config) {
+  const { username, follower_count, engagement_rate, niche, email, ig_user_id, source } = payload;
+
+  if (!username) return { ok: false, error: 'username required' };
+
+  const score = _scoreCreator({ follower_count, engagement_rate });
+
+  // Dedup — skip if already outreached in last 30 days
+  const { data: existing } = await sb()
+    .from('ugc_leads')
+    .select('id, status')
+    .eq('tenant_id', tenantId)
+    .eq('username', username)
+    .gte('created_at', new Date(Date.now() - 30 * 86400000).toISOString())
+    .single()
+    .catch(() => ({ data: null }));
+
+  if (existing) return { ok: true, workflow: 'SC-01', skipped: true, reason: 'already_contacted' };
+
+  let brief = null;
+  let outreachSent = false;
+
+  if (score >= 20 && email) {
+    brief = await _generateOutreachBrief({ username, follower_count, engagement_rate, niche }, config).catch(() => null);
+
+    if (brief && process.env.BREVO_API_KEY) {
+      try {
+        await axios.post('https://api.brevo.com/v3/smtp/email', {
+          sender:      { name: config.brand_name, email: config.ops_email || process.env.BREVO_SENDER_EMAIL },
+          to:          [{ email, name: `@${username}` }],
+          subject:     brief.email_subject,
+          textContent: brief.email_body,
+        }, { headers: { 'api-key': process.env.BREVO_API_KEY } });
+        outreachSent = true;
+      } catch (err) {
+        console.error('[SC-01] Brevo send failed:', err.message);
       }
-    }),
-    sb.from('ugc_library')
-      .select('post_id')
-      .eq('tenant_id', tenantId)
-      .gte('created_at', new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString())
-  ]);
-
-  const igPosts = igResult.status === 'fulfilled' ? igResult.value.data?.data || [] : [];
-  const existing = existingResult.status === 'fulfilled' ? existingResult.value.data || [] : [];
-  const existingIds = existing.map(e => e.post_id);
-
-  const newPosts = igPosts.filter(p => !existingIds.includes(p.id));
-  if (newPosts.length === 0) return { processed: 0 };
-
-  let processed = 0;
-
-  for (const post of newPosts) {
-    try {
-      // FIX BUG-05: Use owner.id (IGSID), NOT username, for IG Messaging API
-      const creatorIgsid = post.owner?.id || null;
-
-      const aiRaw = await callOpenAI(tenantConfig.openai_api_key || process.env.OPENAI_API_KEY, [
-        {
-          role: 'system',
-          content: 'You are a UGC curator. Analyze quality: image/video quality score, brand alignment, engagement quality. Write a friendly permission request message. Return ONLY JSON.'
-        },
-        {
-          role: 'user',
-          content: `Creator: @${post.username}\nCaption: ${post.caption || ''}\nMedia type: ${post.media_type}\n\nReturn JSON:\n{"quality_score": number (1-10), "brand_aligned": boolean, "permission_message": "string", "suggested_use": "social|ads|website", "priority": "high|medium|low"}`
-        }
-      ], 'gpt-4o-mini');
-
-      const analysis = parseAiJson(aiRaw, {
-        quality_score: 5,
-        brand_aligned: true,
-        permission_message: 'Hi! We love your post. May we share it? 🙏',
-        suggested_use: 'social',
-        priority: 'medium'
-      });
-
-      // Skip low quality
-      if (analysis.quality_score < 5) continue;
-
-      const ugcId = 'UGC-' + Date.now() + Math.random().toString(36).substring(2, 5);
-
-      await sb.from('ugc_library').insert({
-        ugc_id: ugcId,
-        tenant_id: tenantId,
-        post_id: post.id,
-        platform: 'instagram',
-        creator_handle: post.username,
-        creator_igsid: creatorIgsid,
-        media_url: post.media_url,
-        permalink: post.permalink,
-        caption: post.caption || '',
-        quality_score: analysis.quality_score,
-        brand_aligned: analysis.brand_aligned,
-        permission_message: analysis.permission_message,
-        suggested_use: analysis.suggested_use,
-        priority: analysis.priority,
-        permission_status: 'pending',
-        posted_at: post.timestamp,
-        created_at: new Date().toISOString()
-      });
-
-      // Send permission DM only if we have an IGSID
-      // (creator must have messaged the account first for IGSID to be available)
-      let dmSent = false;
-      if (creatorIgsid) {
-        try {
-          await axios.post(
-            'https://graph.instagram.com/v19.0/me/messages',
-            {
-              recipient: { id: creatorIgsid },
-              message: { text: analysis.permission_message }
-            },
-            { params: { access_token: igToken }, headers: { 'Content-Type': 'application/json' } }
-          );
-
-          await sb.from('ugc_library')
-            .update({ permission_status: 'requested' })
-            .eq('ugc_id', ugcId)
-            .eq('tenant_id', tenantId);
-
-          dmSent = true;
-        } catch (err) {
-          console.error(`Permission DM failed for ${post.username}:`, err.message);
-        }
-      }
-
-      await notify(tenantConfig, 'slack_marketing_channel', {
-        text: `📸 NEW UGC COLLECTED\n\nCreator: @${post.username}\nQuality Score: ${analysis.quality_score}/10\nBrand Aligned: ${analysis.brand_aligned ? 'Yes' : 'No'}\nSuggested Use: ${analysis.suggested_use}\nPriority: ${analysis.priority}\n\nPermission DM: ${dmSent ? 'Sent ✅' : creatorIgsid ? 'Failed ❌' : 'Skipped — no IGSID (creator must message us first)'}`
-      });
-
-      processed++;
-    } catch (err) {
-      console.error(`UGC processing failed for post ${post.id}:`, err.message);
     }
   }
 
-  return { processed };
+  // ── Save lead ────────────────────────────────────────────
+  await sb().from('ugc_leads').insert({
+    tenant_id:       tenantId,
+    username,
+    ig_user_id:      ig_user_id || null,
+    follower_count:  follower_count || 0,
+    engagement_rate: engagement_rate || 0,
+    niche:           niche || null,
+    email:           email || null,
+    score,
+    source:          source || 'manual',
+    brief_summary:   brief?.brief_summary || null,
+    outreach_sent:   outreachSent,
+    status:          outreachSent ? 'outreached' : (score >= 20 ? 'qualified' : 'low_score'),
+    created_at:      new Date().toISOString(),
+  }).catch(() => {});
+
+  return {
+    ok:            true,
+    workflow:      'SC-01',
+    username,
+    score,
+    outreach_sent: outreachSent,
+    status:        outreachSent ? 'outreached' : 'qualified',
+  };
 }
 
-module.exports = { runUgcCollector };
+// ─────────────────────────────────────────────────────────────
+// Scheduler runner — scan Instagram mentions + process queue
+// ─────────────────────────────────────────────────────────────
+
+async function runUgcCollector(tenantId, config) {
+  const igToken = config.ig_page_token || process.env.INSTAGRAM_ACCESS_TOKEN;
+  const igPageId = config.ig_page_id;
+
+  let newMentions = [];
+
+  // Fetch recent mentions from Instagram
+  if (igPageId && igToken) {
+    try {
+      const res = await axios.get(
+        `https://graph.facebook.com/v19.0/${igPageId}/tags`,
+        { params: { fields: 'id,username,followers_count,media_type', access_token: igToken, limit: 25 } }
+      );
+      newMentions = (res.data.data || []).map(m => ({
+        username:        m.username || m.id,
+        ig_user_id:      m.id,
+        follower_count:  m.followers_count || 0,
+        engagement_rate: 0.03,
+        source:          'ig_mention',
+      }));
+    } catch (err) {
+      console.error('[SC-01] Instagram mentions fetch failed:', err.message);
+    }
+  }
+
+  // Also pull from manual ugc_leads queue (status = 'pending')
+  const { data: queued } = await sb()
+    .from('ugc_leads')
+    .select('*')
+    .eq('tenant_id', tenantId)
+    .eq('status', 'pending')
+    .limit(20)
+    .catch(() => ({ data: [] }));
+
+  const allLeads = [...newMentions, ...(queued || [])];
+
+  let processed = 0;
+  for (const lead of allLeads) {
+    try {
+      const r = await handleUgcCollect(tenantId, lead, config);
+      if (r.ok && !r.skipped) processed++;
+    } catch (err) {
+      console.error(`[SC-01] Failed for @${lead.username}:`, err.message);
+    }
+  }
+
+  if (processed > 0) {
+    await notify(config, 'ugc_leads', `🎥 UGC scan: ${processed} new creators processed.`, 'info').catch(() => {});
+  }
+}
+
+module.exports = { handleUgcCollect, runUgcCollector };

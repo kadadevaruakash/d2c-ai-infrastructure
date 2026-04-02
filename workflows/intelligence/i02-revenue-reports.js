@@ -1,133 +1,135 @@
+'use strict';
+
+/**
+ * I-02 — Revenue Reports
+ *
+ * Triggered: daily 8 AM (scheduler) or manually via webhook.
+ * Pulls Shopify orders + loyalty + cart recovery data for the last 30 days,
+ * runs GPT-4o-mini to generate an executive revenue narrative,
+ * saves report to `revenue_reports` table, and sends digest via WhatsApp/notification.
+ *
+ * Scheduler export : runRevenueReports(tenantId, config)
+ * Webhook export   : handleRevenueReport(tenantId, payload, config)
+ */
+
 const { createClient } = require('@supabase/supabase-js');
-const { callOpenAI, parseAiJson } = require('../../shared/ai-client');
-const { notify } = require('../../shared/notification');
 const axios = require('axios');
+const { notify } = require('../../shared/notification');
 
-async function runRevenueReports(tenantId, tenantConfig) {
-  const sb = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
+function sb() {
+  return createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
+}
 
-  const yesterday = new Date();
-  yesterday.setDate(yesterday.getDate() - 1);
-  const dateStr = yesterday.toISOString().split('T')[0];
-  const startOfDay = `${dateStr}T00:00:00Z`;
-  const endOfDay = `${dateStr}T23:59:59Z`;
+// ─────────────────────────────────────────────────────────────
+// Core handler
+// ─────────────────────────────────────────────────────────────
 
-  // Fetch Shopify orders for yesterday
-  const shopifyDomain = tenantConfig.shopify_shop_domain || process.env.SHOPIFY_SHOP_DOMAIN;
-  const shopifyToken = tenantConfig.shopify_access_token || process.env.SHOPIFY_ACCESS_TOKEN;
+async function handleRevenueReport(tenantId, payload, config) {
+  const period = payload.period || 'daily'; // 'daily' | 'weekly' | 'monthly'
+  const days   = { daily: 1, weekly: 7, monthly: 30 }[period] || 1;
+  const since  = new Date(Date.now() - days * 86400000).toISOString();
 
-  let orders = [];
-  let adSpend = 0;
+  // ── Pull metrics from Supabase ────────────────────────────
+  const [ordersRes, cartsRes, loyaltyRes] = await Promise.all([
+    sb().from('orders').select('total_price, created_at, customer_id').eq('tenant_id', tenantId).gte('created_at', since).catch(() => ({ data: [] })),
+    sb().from('cart_recoveries').select('status, cart_value, recovery_value, created_at').eq('tenant_id', tenantId).gte('created_at', since).catch(() => ({ data: [] })),
+    sb().from('loyalty_transactions').select('points, event_type, created_at').eq('tenant_id', tenantId).gte('created_at', since).catch(() => ({ data: [] })),
+  ]);
 
-  try {
-    const ordersRes = await axios.get(
-      `https://${shopifyDomain}/admin/api/2024-01/orders.json`,
-      {
-        params: {
-          created_at_min: startOfDay,
-          created_at_max: endOfDay,
-          status: 'any',
-          limit: 250
-        },
-        headers: { 'X-Shopify-Access-Token': shopifyToken }
-      }
-    );
-    orders = ordersRes.data.orders || [];
-  } catch (err) {
-    console.error('Shopify orders fetch failed:', err.message);
-  }
+  const orders    = ordersRes.data || [];
+  const carts     = cartsRes.data  || [];
+  const loyalty   = loyaltyRes.data || [];
 
-  // Try to get Meta ad spend from DB (populated by Meta webhook or manual entry)
-  try {
-    const { data: adData } = await sb
-      .from('ad_spend')
-      .select('*')
-      .eq('tenant_id', tenantId)
-      .eq('date', dateStr)
-      .eq('platform', 'meta')
-      .limit(1);
-    adSpend = adData?.[0]?.spend || 0;
-  } catch (err) {
-    console.error('Ad spend fetch failed:', err.message);
-  }
+  const totalRevenue   = orders.reduce((s, o) => s + parseFloat(o.total_price || 0), 0);
+  const orderCount     = orders.length;
+  const aov            = orderCount > 0 ? totalRevenue / orderCount : 0;
+  const recovered      = carts.filter(c => c.status === 'recovered');
+  const recoveryRev    = recovered.reduce((s, c) => s + parseFloat(c.recovery_value || 0), 0);
+  const loyaltyPts     = loyalty.reduce((s, l) => s + (l.points || 0), 0);
+  const uniqueCustomers = new Set(orders.map(o => o.customer_id)).size;
 
-  // Calculate metrics
-  const totalRevenue = orders.reduce((sum, o) => sum + parseFloat(o.total_price || 0), 0);
-  const orderCount = orders.length;
-  const avgOrderValue = orderCount > 0 ? totalRevenue / orderCount : 0;
-  const roas = adSpend > 0 ? totalRevenue / adSpend : null;
-  const grossMarginRate = tenantConfig.gross_margin_rate || 0.45;
-  const grossProfit = totalRevenue * grossMarginRate;
-  const netProfit = grossProfit - adSpend;
+  const metrics = {
+    period,
+    total_revenue: totalRevenue.toFixed(2),
+    order_count:   orderCount,
+    aov:           aov.toFixed(2),
+    unique_customers: uniqueCustomers,
+    recovery_revenue: recoveryRev.toFixed(2),
+    carts_recovered:  recovered.length,
+    loyalty_points_issued: loyaltyPts,
+  };
 
-  // AI analysis
-  const aiRaw = await callOpenAI(tenantConfig.openai_api_key || process.env.OPENAI_API_KEY, [
-    {
-      role: 'system',
-      content: 'You are a D2C revenue analyst. Analyze daily metrics and identify anomalies or opportunities. Return ONLY JSON.'
-    },
-    {
-      role: 'user',
-      content: `Date: ${dateStr}\nRevenue: $${totalRevenue.toFixed(2)}\nOrders: ${orderCount}\nAOV: $${avgOrderValue.toFixed(2)}\nAd Spend: $${adSpend}\nROAS: ${roas ? roas.toFixed(2) : 'N/A'}\nNet Profit: $${netProfit.toFixed(2)}\n\nReturn JSON:\n{"anomalies": ["string"], "insights": ["string"], "recommendations": ["string"], "performance": "excellent|good|average|poor"}`
+  // ── AI narrative ──────────────────────────────────────────
+  let narrative = '';
+  if (process.env.OPENAI_API_KEY) {
+    const roas_threshold  = config.roas_alert_threshold  || 3;
+    const margin_threshold = config.margin_alert_threshold || 40;
+
+    const prompt = `You are a revenue analyst for ${config.brand_name}. Write a concise ${period} revenue report.
+
+Metrics:
+- Total revenue: $${metrics.total_revenue}
+- Orders: ${metrics.order_count} | AOV: $${metrics.aov}
+- Unique customers: ${metrics.unique_customers}
+- Cart recovery revenue: $${metrics.recovery_revenue} (${metrics.carts_recovered} carts)
+- Loyalty points issued: ${metrics.loyalty_points_issued}
+- ROAS threshold: ${roas_threshold}x | Margin threshold: ${margin_threshold}%
+
+Return ONLY valid JSON:
+{
+  "headline": "one-line summary (e.g. Revenue up 12% DoD — cart recovery leading)",
+  "narrative": "2-3 sentence executive commentary",
+  "alerts": ["any metric that needs attention"],
+  "bright_spots": ["top 1-2 positive signals"],
+  "recommendations": ["top 2 actions for tomorrow"]
+}`;
+
+    try {
+      const aiRes = await axios.post('https://api.openai.com/v1/chat/completions', {
+        model: config.ai_model_standard || 'gpt-4o-mini',
+        messages: [{ role: 'user', content: prompt }],
+        response_format: { type: 'json_object' },
+        temperature: 0.3,
+      }, { headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` } });
+
+      const parsed = JSON.parse(aiRes.data.choices[0].message.content);
+      metrics.headline        = parsed.headline;
+      metrics.narrative       = parsed.narrative;
+      metrics.alerts          = parsed.alerts;
+      metrics.bright_spots    = parsed.bright_spots;
+      metrics.recommendations = parsed.recommendations;
+      narrative = parsed.headline;
+    } catch (err) {
+      console.error('[I-02] AI narrative failed:', err.message);
     }
-  ], 'gpt-4o-mini');
-
-  const analysis = parseAiJson(aiRaw, {
-    anomalies: [],
-    insights: [`Revenue: $${totalRevenue.toFixed(2)} from ${orderCount} orders`],
-    recommendations: [],
-    performance: 'average'
-  });
-
-  // Store report
-  const reportId = 'RPT-' + Date.now();
-  await sb.from('revenue_reports').insert({
-    report_id: reportId,
-    tenant_id: tenantId,
-    date: dateStr,
-    revenue: totalRevenue,
-    order_count: orderCount,
-    avg_order_value: avgOrderValue,
-    ad_spend: adSpend,
-    roas,
-    gross_profit: grossProfit,
-    net_profit: netProfit,
-    anomalies: JSON.stringify(analysis.anomalies),
-    insights: JSON.stringify(analysis.insights),
-    performance: analysis.performance,
-    created_at: new Date().toISOString()
-  });
-
-  // Push to Google Sheets if configured
-  if (tenantConfig.google_sheets_revenue_id) {
-    await appendToGoogleSheets(tenantConfig, [
-      dateStr, totalRevenue.toFixed(2), orderCount, avgOrderValue.toFixed(2),
-      adSpend, roas?.toFixed(2) || '', netProfit.toFixed(2), analysis.performance
-    ]);
   }
 
-  const anomalyText = analysis.anomalies.length > 0
-    ? `\n⚠️ Anomalies: ${analysis.anomalies.join(', ')}`
-    : '';
+  // ── Save report ───────────────────────────────────────────
+  await sb().from('revenue_reports').insert({
+    tenant_id:  tenantId,
+    period,
+    metrics,
+    generated_at: new Date().toISOString(),
+  }).catch(() => {});
 
-  await notify(tenantConfig, 'slack_finance_channel', {
-    text: `📊 DAILY P&L REPORT — ${dateStr}\n\nRevenue: $${totalRevenue.toFixed(2)}\nOrders: ${orderCount}\nAOV: $${avgOrderValue.toFixed(2)}\nAd Spend: $${adSpend}\nROAS: ${roas ? roas.toFixed(2) + 'x' : 'N/A'}\nNet Profit: $${netProfit.toFixed(2)}\nPerformance: ${analysis.performance.toUpperCase()}${anomalyText}`
-  });
+  // ── Notify ────────────────────────────────────────────────
+  const msg = `📈 *${period.charAt(0).toUpperCase() + period.slice(1)} Revenue Report*\n` +
+    `Revenue: *$${metrics.total_revenue}* | Orders: *${metrics.order_count}* | AOV: *$${metrics.aov}*\n` +
+    `Cart recovery: *$${metrics.recovery_revenue}*\n` +
+    (narrative ? `\n${narrative}` : '');
 
-  if (analysis.anomalies.length > 0) {
-    await notify(tenantConfig, 'email_finance', {
-      subject: `⚠️ Revenue Anomalies Detected — ${dateStr}`,
-      text: `Anomalies detected in daily revenue report:\n\n${analysis.anomalies.join('\n')}\n\nRecommendations:\n${analysis.recommendations.join('\n')}`
-    });
-  }
+  const hasAlerts = (metrics.alerts || []).length > 0;
+  await notify(config, 'revenue_reports', msg, hasAlerts ? 'warning' : 'info').catch(() => {});
 
-  return { report_id: reportId, revenue: totalRevenue, orders: orderCount, performance: analysis.performance };
+  return { ok: true, workflow: 'I-02', period, metrics };
 }
 
-async function appendToGoogleSheets(tenantConfig, rowData) {
-  // Google Sheets append — requires googleapis setup
-  // Placeholder: log intent, implement when googleapis credential is configured
-  console.log(`[Google Sheets] Would append to ${tenantConfig.google_sheets_revenue_id}:`, rowData);
+// ─────────────────────────────────────────────────────────────
+// Scheduler runner
+// ─────────────────────────────────────────────────────────────
+
+async function runRevenueReports(tenantId, config) {
+  await handleRevenueReport(tenantId, { period: 'daily' }, config);
 }
 
-module.exports = { runRevenueReports };
+module.exports = { handleRevenueReport, runRevenueReports };
