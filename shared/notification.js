@@ -1,65 +1,95 @@
+'use strict';
+
 /**
  * D2C AI Infrastructure — Centralized Notification Service
  *
- * Replaces the 24 duplicated Slack nodes across all workflows.
- * Single entry point for all outbound notifications (Slack, email alerts).
+ * WhatsApp replaces Slack as the ops notification channel.
+ * All 24 workflows route through here instead of calling Slack directly.
  *
- * How to use in n8n:
- *   Replace each workflow's Slack node with a single HTTP Request node that calls:
- *   POST {{ $env.N8N_BASE_URL }}/api/notify
- *   Body: { tenantSlug, channel, message, level, metadata }
+ * How to use in any workflow:
+ *   const notifier = require('../../shared/notification');
+ *   await notifier.notify(config, 'hot_leads', 'New hot lead scored 88/100', 'success');
  *
- * The /api/notify endpoint calls this module.
+ * Channel keys map to phone numbers stored in tenant_config.
+ * Urgent channels (incidents, escalations) also send to ceo_phone.
+ *
+ * The /api/notify endpoint calls notifier.notify() — unchanged API,
+ * only the transport layer changed (WhatsApp instead of Slack).
  */
 
-'use strict';
+const whatsapp = require('./whatsapp');
 
-const { WebClient } = require('@slack/web-api');
+// ─────────────────────────────────────────────────────────────
+// Channel → phone mapping
+// ─────────────────────────────────────────────────────────────
 
-// ──────────────────────────────────────────────
-// Slack notifier
-// ──────────────────────────────────────────────
+// Maps channelKey to one or more phone fields in tenant_config.
+// A channel can notify multiple phones (e.g. incidents → ops + ceo).
+const CHANNEL_PHONE_MAP = {
+  leads:       ['sales_rep_phone'],
+  hot_leads:   ['sales_rep_phone', 'sales_lead_phone'],
+  outreach:    ['sales_rep_phone'],
+  content:     ['content_manager_phone'],
+  amazon:      ['ops_phone'],
+  launches:    ['content_manager_phone', 'ops_phone'],
+  analytics:   ['sales_lead_phone'],
+  revenue:     ['ceo_phone'],
+  crm:         ['ops_phone'],
+  retention:   ['ops_phone'],
+  support:     ['ops_phone'],
+  reviews:     ['ops_phone', 'ceo_phone'],
+  social:      ['content_manager_phone'],
+  ugc:         ['content_manager_phone'],
+  incidents:   ['ceo_phone', 'ops_phone'],
+  seo:         ['content_manager_phone'],
+  sales:       ['sales_rep_phone', 'sales_lead_phone'],
+  checkout:    ['ops_phone'],
+};
+
+// ─────────────────────────────────────────────────────────────
+// NotificationService
+// ─────────────────────────────────────────────────────────────
 
 class NotificationService {
-  constructor() {
-    this._slackClient = null;
-  }
-
-  _getSlack() {
-    if (!this._slackClient) {
-      this._slackClient = new WebClient(process.env.SLACK_BOT_TOKEN);
-    }
-    return this._slackClient;
-  }
 
   /**
-   * Send a Slack message to a channel.
-   * @param {string} channel      - Slack channel name e.g. '#leads'
-   * @param {string} message      - Message text (supports Slack mrkdwn)
-   * @param {string} [level]      - 'info' | 'warning' | 'error' | 'success'
+   * Send a WhatsApp notification to the phone(s) mapped to channelKey.
+   *
+   * @param {string} channel  - e.g. '#leads' (legacy Slack format, strip the #)
+   * @param {string} message  - Notification text
+   * @param {string} level    - 'info' | 'warning' | 'error' | 'success'
+   * @param {object} [config] - Tenant config (for phone lookup)
    */
-  async slack(channel, message, level = 'info') {
-    const levelEmoji = { info: 'ℹ️', warning: '⚠️', error: '🚨', success: '✅' };
-    const prefix = levelEmoji[level] || '';
-    const text = prefix ? `${prefix} ${message}` : message;
+  async whatsapp(channel, message, level = 'info', config = {}) {
+    // Strip '#' prefix if passed from legacy Slack-style callers
+    const cleanChannel = channel.replace(/^#/, '');
+    const phoneKeys    = CHANNEL_PHONE_MAP[cleanChannel] || ['ops_phone'];
 
-    try {
-      await this._getSlack().chat.postMessage({
-        channel,
-        text,
-        mrkdwn: true,
-      });
-    } catch (err) {
-      console.error(`[notify] Slack error on channel ${channel}:`, err.message);
+    const phones = [...new Set(
+      phoneKeys
+        .map(k => config[k])
+        .filter(Boolean)
+    )];
+
+    if (phones.length === 0) {
+      // Fallback to ceo_phone if no channel phone is configured
+      const fallback = config.ceo_phone;
+      if (fallback) phones.push(fallback);
     }
+
+    const sends = phones.map(phone =>
+      whatsapp.sendNotify(phone, message, level).catch(err =>
+        console.error(`[notify] WhatsApp error to ${phone}:`, err.message)
+      )
+    );
+
+    await Promise.all(sends);
   }
 
   /**
    * Send a critical email alert using Brevo transactional API.
-   * @param {object} params
-   * @param {string} params.to       - Recipient email
-   * @param {string} params.subject  - Email subject
-   * @param {string} params.body     - Plain text body
+   * Kept for backwards compatibility — email alerts are still useful
+   * for audit trails and finance/compliance notifications.
    */
   async emailAlert({ to, subject, body }) {
     const axios = require('axios');
@@ -67,14 +97,14 @@ class NotificationService {
       await axios.post(
         'https://api.brevo.com/v3/smtp/email',
         {
-          sender: { email: process.env.BREVO_FROM_EMAIL, name: process.env.BREVO_FROM_NAME || 'D2C AI' },
-          to: [{ email: to }],
+          sender:      { email: process.env.BREVO_FROM_EMAIL, name: process.env.BREVO_FROM_NAME || 'D2C AI' },
+          to:          [{ email: to }],
           subject,
           textContent: body,
         },
         {
           headers: {
-            'api-key': process.env.BREVO_API_KEY,
+            'api-key':      process.env.BREVO_API_KEY,
             'Content-Type': 'application/json',
           },
         }
@@ -85,46 +115,34 @@ class NotificationService {
   }
 
   /**
-   * Route a notification based on workflow, level, and tenant config.
-   * This is the single entry point called by /api/notify.
+   * Route a notification based on channel key and tenant config.
+   * This is the single entry point called by POST /api/notify.
    *
-   * @param {object} tenantConfig  - Row from tenant_config table
-   * @param {string} channelKey    - Key from slack_channels in brand config
-   *                                 e.g. 'hot_leads', 'revenue', 'support'
+   * @param {object} tenantConfig  - Row from tenant_config
+   * @param {string} channelKey    - e.g. 'hot_leads', 'revenue', 'incidents'
    * @param {string} message       - Notification text
    * @param {string} level         - 'info' | 'warning' | 'error' | 'success'
-   * @param {object} [emailOpts]   - If set, also sends email alert
+   * @param {object} [emailOpts]   - If set, also sends email alert (for compliance channels)
    */
   async notify(tenantConfig, channelKey, message, level = 'info', emailOpts = null) {
-    // Map channelKey to the actual channel name from tenant config
-    const channelMap = {
-      leads:       tenantConfig.slack_channel_leads,
-      outreach:    tenantConfig.slack_channel_outreach,
-      hot_leads:   tenantConfig.slack_channel_hot_leads,
-      content:     tenantConfig.slack_channel_content,
-      amazon:      tenantConfig.slack_channel_amazon,
-      launches:    tenantConfig.slack_channel_launches,
-      analytics:   tenantConfig.slack_channel_analytics,
-      revenue:     tenantConfig.slack_channel_revenue,
-      crm:         tenantConfig.slack_channel_crm,
-      retention:   tenantConfig.slack_channel_retention,
-      support:     tenantConfig.slack_channel_support,
-      reviews:     tenantConfig.slack_channel_reviews,
-      social:      tenantConfig.slack_channel_social,
-      ugc:         tenantConfig.slack_channel_ugc,
-      incidents:   tenantConfig.slack_channel_incidents,
-      seo:         tenantConfig.slack_channel_seo,
-      sales:       tenantConfig.slack_channel_sales,
-      checkout:    tenantConfig.slack_channel_checkout,
-    };
-
-    const channel = channelMap[channelKey] || '#general';
-
-    await this.slack(channel, message, level);
+    await this.whatsapp(channelKey, message, level, tenantConfig);
 
     if (emailOpts) {
       await this.emailAlert(emailOpts);
     }
+  }
+
+  /**
+   * Direct phone notification — bypasses channel mapping.
+   * Use when you know the exact recipient.
+   *
+   * @param {string} phone
+   * @param {string} message
+   * @param {string} level
+   */
+  async direct(phone, message, level = 'info') {
+    if (!phone) return;
+    await whatsapp.sendNotify(phone, message, level);
   }
 }
 

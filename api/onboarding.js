@@ -15,6 +15,7 @@
 const axios   = require('axios');
 const { createClient } = require('@supabase/supabase-js');
 const { BrandConfig }  = require('../config/brand.config');
+const { provisionCreditAccount } = require('../shared/credits');
 
 // Webhook events we register on Shopify
 const SHOPIFY_WEBHOOK_TOPICS = [
@@ -60,7 +61,12 @@ async function onboardTenant(request) {
   const { error: configError } = await sb.from('tenant_config').insert(configRow);
   if (configError) throw new Error(`Failed to store config: ${configError.message}`);
 
-  // ── Step 3: Register Shopify webhooks ─────
+  // ── Step 3: Provision PAYG credit account (500 trial credits) ─
+  await provisionCreditAccount(tenant.id, null).catch(err =>
+    console.error('[onboard] Credit account provisioning failed:', err.message)
+  );
+
+  // ── Step 4: Register Shopify webhooks ─────
   const apiBase = process.env.API_BASE_URL || `http://localhost:${process.env.PORT || 3000}`;
   const webhookUrls = {};
   const shopifyWebhooksRegistered = [];
@@ -91,6 +97,7 @@ async function onboardTenant(request) {
     }
   }
 
+  // ── Step 5: Return summary ─────────────────
   // Non-Shopify webhook URLs
   const webhookRoutes = [
     'lead-capture',
@@ -106,7 +113,7 @@ async function onboardTenant(request) {
     webhookUrls[route] = `${apiBase}/webhook/${slug}/${route}`;
   }
 
-  // ── Step 4: Return summary ─────────────────
+  // ── Step 6: Return summary ─────────────────
   return {
     success: true,
     tenant: {
@@ -117,6 +124,7 @@ async function onboardTenant(request) {
     },
     shopify_webhooks_registered: shopifyWebhooksRegistered,
     webhook_urls: webhookUrls,
+    trial_credits: 500,
     next_steps: [
       'Point your Meta (WhatsApp/Instagram) webhook to the whatsapp-support and ig-dm URLs above',
       'Add your Instagram Access Token and Account ID in the tenant_config table',

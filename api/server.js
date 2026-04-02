@@ -18,6 +18,8 @@ const { contentCalendarRouter }  = require('./content-calendar');
 const { ragManagerRouter }       = require('./rag-manager');
 const { reportsRouter }          = require('./reports');
 const { logExecution }           = require('./execution-logger');
+const { handleWhatsAppReply }    = require('./whatsapp-reply-router');
+const { beforeWorkflow, afterWorkflow } = require('./usage-meter');
 
 // Webhook handlers
 const { handleLeadCapture }       = require('../workflows/acquire/a01-lead-capture');
@@ -95,8 +97,31 @@ async function webhookHandler(req, res, handlerFn, workflowId) {
     const config = await getTenantConfig(tenantSlug);
     if (!config) return res.status(404).json({ error: 'Tenant not found' });
 
+    // ── Credit gate ──────────────────────────────────────────
+    if (workflowId) {
+      const credit = await beforeWorkflow(config.tenant_id, workflowId);
+      if (!credit.allowed) {
+        return res.status(402).json({
+          error:          'Insufficient credits',
+          reason:         credit.reason,
+          balance:        credit.balance_before,
+          cost_credits:   credit.cost_credits,
+          recharge_url:   `/billing?topup=1`,
+        });
+      }
+    }
+
     if (workflowId) emitWorkflowRun(config.tenant_id, workflowId, 'running', null);
-    const result = await handlerFn(config.tenant_id, req.body, config);
+
+    let result;
+    let success = false;
+    try {
+      result  = await handlerFn(config.tenant_id, req.body, config);
+      success = true;
+    } finally {
+      if (workflowId) await afterWorkflow(config.tenant_id, workflowId, success);
+    }
+
     if (workflowId) emitWorkflowRun(config.tenant_id, workflowId, 'completed', result);
 
     // Fire cascades asynchronously — don't block webhook response
@@ -144,13 +169,69 @@ app.post('/webhook/:tenantSlug/whatsapp-support', (req, res) => webhookHandler(r
 app.post('/webhook/:tenantSlug/rag-query',         (req, res) => webhookHandler(req, res, handleRagQuery, 'S-02'));
 app.post('/webhook/:tenantSlug/ceo-alert',         (req, res) => webhookHandler(req, res, handleCeoAlert, 'S-04'));
 
-// Meta webhook verification for WhatsApp
+// Meta webhook verification for WhatsApp (support + reply)
 app.get('/webhook/:tenantSlug/whatsapp-support', (req, res) => {
   const { 'hub.mode': mode, 'hub.verify_token': token, 'hub.challenge': challenge } = req.query;
   if (mode === 'subscribe' && token === process.env.META_WEBHOOK_VERIFY_TOKEN) {
     res.send(challenge);
   } else {
     res.status(403).send('Forbidden');
+  }
+});
+
+// ── WhatsApp Reply Router ─────────────────────────────
+// All inbound WA messages from ops staff (reps, managers) come here.
+// The reply router resolves the pending action and dispatches accordingly.
+// This is ONE Meta webhook subscription — all phone numbers in the
+// Business Account send to the same webhook URL.
+app.post('/webhook/:tenantSlug/whatsapp-reply', async (req, res) => {
+  const { tenantSlug } = req.params;
+  try {
+    const config = await getTenantConfig(tenantSlug);
+    if (!config) return res.status(404).json({ error: 'Tenant not found' });
+    await handleWhatsAppReply(req, res, config.tenant_id, config);
+  } catch (err) {
+    console.error('[whatsapp-reply] Error:', err.message);
+    // Still send 200 to Meta to prevent retries for unrecoverable errors
+    if (!res.headersSent) res.json({ received: true });
+  }
+});
+
+// Meta webhook verification for WhatsApp reply
+app.get('/webhook/:tenantSlug/whatsapp-reply', (req, res) => {
+  const { 'hub.mode': mode, 'hub.verify_token': token, 'hub.challenge': challenge } = req.query;
+  if (mode === 'subscribe' && token === process.env.META_WEBHOOK_VERIFY_TOKEN) {
+    res.send(challenge);
+  } else {
+    res.status(403).send('Forbidden');
+  }
+});
+
+// ── Cold Lead Scan (Scenario 5 — manual trigger) ─────
+app.post('/webhook/:tenantSlug/cold-lead-scan', requireApiKey, async (req, res) => {
+  const { tenantSlug } = req.params;
+  try {
+    const config = await getTenantConfig(tenantSlug);
+    if (!config) return res.status(404).json({ error: 'Tenant not found' });
+    const { handleColdLeadScan } = require('../workflows/intelligence/i03-customer-intel');
+    const result = await handleColdLeadScan(config.tenant_id, req.body || {}, config);
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Cold Email Batch (Scenario 2 — manual trigger) ───
+app.post('/webhook/:tenantSlug/cold-email-batch', requireApiKey, async (req, res) => {
+  const { tenantSlug } = req.params;
+  try {
+    const config = await getTenantConfig(tenantSlug);
+    if (!config) return res.status(404).json({ error: 'Tenant not found' });
+    const { handleColdEmailBatch } = require('../workflows/acquire/a02-cold-email');
+    const result = await handleColdEmailBatch(config.tenant_id, req.body || {}, config);
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 

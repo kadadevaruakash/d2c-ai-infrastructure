@@ -184,6 +184,52 @@ const MOCK = {
     { key: 'pinecone',  label: 'Pinecone (RAG)',   connected: true,  env_var: 'PINECONE_API_KEY',      workflows: ['S-02'] },
     { key: 'google',    label: 'Google Ads',       connected: false, env_var: 'GOOGLE_SERVICE_ACCOUNT',workflows: ['I-02','I-04'] },
   ],
+  billingBalance: {
+    balance_credits:      2840,
+    monthly_spend_usd:    14.20,
+    spend_cap_usd:        50,
+    at_cap:               false,
+    auto_topup_enabled:   false,
+    auto_topup_threshold: 500,
+    auto_topup_bundle:    'growth',
+    base_fee_active:      false,
+    has_payment_method:   false,
+  },
+  billingPlans: {
+    base_fee_usd: 29,
+    bundles: [
+      { id: 'starter', label: 'Starter', credits_base: 2000,  credits_bonus: 0,     credits_total: 2000,   price_usd: 20,  price_per_credit: 0.010,  highlight: false, description: 'Perfect for testing and low-volume brands' },
+      { id: 'growth',  label: 'Growth',  credits_base: 5000,  credits_bonus: 1000,  credits_total: 6000,   price_usd: 50,  price_per_credit: 0.0083, highlight: false, description: '20% bonus credits — great for growing brands' },
+      { id: 'pro',     label: 'Pro',     credits_base: 10000, credits_bonus: 5000,  credits_total: 15000,  price_usd: 100, price_per_credit: 0.0067, highlight: true,  description: '50% bonus credits — most popular' },
+      { id: 'scale',   label: 'Scale',   credits_base: 20000, credits_bonus: 20000, credits_total: 40000,  price_usd: 200, price_per_credit: 0.0050, highlight: false, description: '100% bonus credits — serious volume' },
+      { id: 'agency',  label: 'Agency',  credits_base: 50000, credits_bonus: 70000, credits_total: 120000, price_usd: 500, price_per_credit: 0.0042, highlight: false, description: '140% bonus credits — for agencies managing multiple brands' },
+    ],
+  },
+  billingUsage: [
+    { workflow_id: 'A-01',  run_count: 87,  total_credits: 435,  avg_credits: 5  },
+    { workflow_id: 'C-01',  run_count: 44,  total_credits: 88,   avg_credits: 2  },
+    { workflow_id: 'I-03',  run_count: 62,  total_credits: 248,  avg_credits: 4  },
+    { workflow_id: 'SC-04', run_count: 12,  total_credits: 144,  avg_credits: 12 },
+    { workflow_id: 'R-04',  run_count: 23,  total_credits: 92,   avg_credits: 4  },
+    { workflow_id: 'S-02',  run_count: 19,  total_credits: 95,   avg_credits: 5  },
+    { workflow_id: 'A-04',  run_count: 4,   total_credits: 100,  avg_credits: 25 },
+    { workflow_id: 'I-01',  run_count: 10,  total_credits: 80,   avg_credits: 8  },
+    { workflow_id: 'S-01',  run_count: 38,  total_credits: 114,  avg_credits: 3  },
+    { workflow_id: 'SC-03', run_count: 29,  total_credits: 145,  avg_credits: 5  },
+  ],
+  billingTransactions: (() => {
+    const now = Date.now();
+    return [
+      { id: '1', type: 'bonus',  credits: 500,   workflow_id: null,    source: 'trial_bonus',  balance_after: 500,   created_at: new Date(now - 10 * 86400000).toISOString() },
+      { id: '2', type: 'credit', credits: 6000,  workflow_id: null,    source: 'purchase',     balance_after: 6500,  created_at: new Date(now - 5 * 86400000).toISOString() },
+      { id: '3', type: 'debit',  credits: -5,    workflow_id: 'A-01',  source: 'workflow_run', balance_after: 6495,  created_at: new Date(now - 5 * 86400000 + 3600000).toISOString() },
+      { id: '4', type: 'debit',  credits: -4,    workflow_id: 'A-02',  source: 'workflow_run', balance_after: 6491,  created_at: new Date(now - 4 * 86400000).toISOString() },
+      { id: '5', type: 'debit',  credits: -25,   workflow_id: 'A-04',  source: 'workflow_run', balance_after: 6466,  created_at: new Date(now - 3 * 86400000).toISOString() },
+      { id: '6', type: 'refund', credits: 25,    workflow_id: 'A-04',  source: 'workflow_run', balance_after: 6491,  created_at: new Date(now - 3 * 86400000 + 3600000).toISOString() },
+      { id: '7', type: 'debit',  credits: -2,    workflow_id: 'C-01',  source: 'workflow_run', balance_after: 6489,  created_at: new Date(now - 2 * 86400000).toISOString() },
+      { id: '8', type: 'debit',  credits: -12,   workflow_id: 'SC-04', source: 'workflow_run', balance_after: 2840,  created_at: new Date(now - 1 * 86400000).toISOString() },
+    ];
+  })(),
 };
 
 // ── API helper ────────────────────────────────────
@@ -215,6 +261,13 @@ function mockApi(method, path, body) {
     if (path.includes('/ab-tests'))        return resolve(MOCK.abTests);
     if (path.includes('/rag-docs'))        return resolve(MOCK.ragDocs);
     if (path.includes('/integrations'))    return resolve(MOCK.integrations);
+    if (path.includes('/billing/plans'))        return resolve(MOCK.billingPlans);
+    if (path.includes('/billing/balance'))      return resolve(MOCK.billingBalance);
+    if (path.includes('/billing/usage'))        return resolve({ month: '2026-04', usage: MOCK.billingUsage });
+    if (path.includes('/billing/transactions')) return resolve({ transactions: MOCK.billingTransactions });
+    if (path.includes('/billing/settings'))     return resolve({ ok: true });
+    if (path.includes('/billing/purchase-credits')) return resolve({ payment_intent_id: 'pi_demo_' + Date.now(), client_secret: 'pi_demo_secret', amount_usd: body?.bundle_id ? 50 : 100, credits_total: body?.bundle_id ? 6000 : 15000 });
+    if (path.includes('/billing/base-fee-subscribe')) return resolve({ checkout_url: '#demo-checkout' });
     if (method === 'PATCH' || method === 'PUT') return resolve({ ...(body || {}), updated: true });
     if (method === 'POST')  return resolve({ id: 'demo-' + Date.now(), ...(body || {}), created: true });
     if (method === 'DELETE') return resolve({ deleted: true });
@@ -307,6 +360,7 @@ const VIEW_RENDERERS = {
   'ab-tests':   viewAbTests,
   knowledge:    viewKnowledge,
   integrations: viewIntegrations,
+  billing:      viewBilling,
   settings:     viewSettings,
 };
 
@@ -1137,7 +1191,39 @@ window.generateClientToken = async function() {
 };
 
 window.openBillingPortal = async function() {
-  if (state.demo) { toast('Billing portal would open here (demo mode)', 'info'); return; }
+  if (state.demo) {
+    const plans = await api('GET', '/api/billing/plans');
+    const currentPlan = state.config?.plan || 'scale';
+    const rows = plans.map(p => `
+      <div style="border:1px solid ${p.id===currentPlan?'#7c3aed':'#e5e7eb'};border-radius:12px;padding:20px;flex:1;min-width:200px;background:${p.id===currentPlan?'#faf5ff':'#fff'}">
+        ${p.id===currentPlan?'<div style="font-size:11px;font-weight:700;color:#7c3aed;text-transform:uppercase;margin-bottom:6px">Current plan</div>':''}
+        <div style="font-size:18px;font-weight:700;margin-bottom:4px">${p.name}</div>
+        <div style="font-size:28px;font-weight:800;color:#111;margin-bottom:12px">$${p.price_monthly}<span style="font-size:14px;font-weight:400;color:#6b7280">/mo</span></div>
+        <ul style="list-style:none;padding:0;margin:0;font-size:13px;color:#374151">
+          ${p.features.map(f=>`<li style="padding:3px 0">✓ ${f}</li>`).join('')}
+        </ul>
+        ${p.id!==currentPlan?`<button class="btn btn-sm" style="margin-top:16px;width:100%;background:#7c3aed;color:#fff;border:none;border-radius:8px;padding:8px" onclick="toast('Stripe checkout would open here','info')">Upgrade to ${p.name} →</button>`:''}
+      </div>
+    `).join('');
+    const modal = document.createElement('div');
+    modal.id = 'billing-modal';
+    modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:9999;display:flex;align-items:center;justify-content:center';
+    modal.innerHTML = `
+      <div style="background:#fff;border-radius:16px;padding:32px;max-width:780px;width:90%;max-height:90vh;overflow-y:auto">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:24px">
+          <div>
+            <div style="font-size:20px;font-weight:700">Billing & Plans</div>
+            <div style="font-size:13px;color:#6b7280;margin-top:2px">Demo mode — Stripe checkout would open for real upgrades</div>
+          </div>
+          <button onclick="document.getElementById('billing-modal').remove()" style="background:none;border:none;font-size:22px;cursor:pointer;color:#6b7280">×</button>
+        </div>
+        <div style="display:flex;gap:16px;flex-wrap:wrap">${rows}</div>
+      </div>
+    `;
+    modal.addEventListener('click', e => { if (e.target === modal) modal.remove(); });
+    document.body.appendChild(modal);
+    return;
+  }
   try {
     const r = await fetch('/api/billing/portal-session', {
       method: 'POST',
@@ -1421,3 +1507,46 @@ window.closeModal = closeModal;
 window.openReport = openReport;
 window.navTo = navTo;
 window.startOnboard = function() { showScreen('screen-onboard'); };
+
+// ─────────────────────────────────────────────────────────────
+// BILLING VIEW — delegates to billing-view.js
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * window.d2cApi — simple fetch wrapper exposed for billing-view.js.
+ * Respects demo mode by routing through mockApi.
+ */
+window.d2cApi = async function(path, opts = {}) {
+  const method = opts.method || 'GET';
+  let body;
+  if (opts.body) {
+    try { body = JSON.parse(opts.body); } catch (_) { body = opts.body; }
+  }
+  if (state.demo) return mockApi(method, path, body);
+  const fetchOpts = {
+    method,
+    headers: { 'x-api-key': state.key, 'Content-Type': 'application/json' },
+  };
+  if (opts.body) fetchOpts.body = opts.body;
+  const r = await fetch(path, fetchOpts);
+  if (!r.ok) {
+    const err = await r.json().catch(() => ({ error: r.statusText }));
+    throw new Error(err.error || r.statusText);
+  }
+  return r.json();
+};
+
+async function viewBilling(el) {
+  if (!window.billingView) {
+    el.innerHTML = `<div style="padding:48px;color:var(--red)">billing-view.js failed to load.</div>`;
+    return;
+  }
+  // Update sidebar credit badge with live balance
+  try {
+    const bal = await window.d2cApi(`/api/billing/balance/${state.slug}`);
+    const badge = document.getElementById('nav-billing-badge');
+    if (badge) badge.textContent = (bal.balance_credits || 0).toLocaleString() + ' cr';
+  } catch (_) {}
+
+  await window.billingView.renderBillingView(el, state.slug);
+}

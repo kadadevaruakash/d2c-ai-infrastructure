@@ -5,7 +5,8 @@
   "main": "api/server.js",
   "scripts": {
     "start": "node api/server.js",
-    "dev": "nodemon api/server.js"
+    "dev": "nodemon api/server.js",
+    "build": "echo 'Static build skip'"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.52.0",
